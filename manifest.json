@@ -1,0 +1,12 @@
+{
+  "display_name": "MiniMax语音",
+  "loading_order": 20,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Local",
+  "version": "0.2.0",
+  "description": "自动检测引用文本并使用 MiniMax TTS 播放语音，支持多版本、缓存及副 API 格式化。",
+  "auto_update": false
+}

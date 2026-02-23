@@ -1,0 +1,120 @@
+/* 基础面板 - 与酒馆原生风格一致 */
+.minimax-quote-tts-panel-inner {
+    padding: 10px;
+}
+
+.minimax-quote-tts-panel-inner .minimax-quote-tts-row {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 10px; width: 100%;
+}
+
+.minimax-quote-tts-panel-inner .minimax-quote-tts-row label {
+    min-width: 85px; max-width: 85px; font-size: 0.9rem; opacity: 0.85; flex-shrink: 0;
+}
+
+/* 拒绝死板白框 */
+.minimax-quote-tts-panel-inner input:not([type="checkbox"]),
+.minimax-quote-tts-panel-inner select,
+.minimax-tts-editor-dialog input:not([type="checkbox"]),
+.minimax-tts-editor-dialog select {
+    background: rgba(0, 0, 0, 0.25) !important;
+    color: var(--SmartThemeBodyColor, #eee) !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    border-radius: 6px !important;
+    padding: 5px 10px !important;
+    height: 32px !important;
+}
+
+/* 复选框：回归原生打勾样式，去除自定义颜色 */
+.minimax-quote-tts-panel-inner input[type="checkbox"] {
+    width: 16px !important;
+    height: 16px !important;
+    margin: 0 !important;
+    flex: 0 0 auto !important;
+    cursor: pointer;
+    appearance: checkbox !important;
+    -webkit-appearance: checkbox !important;
+}
+
+.minimax-quote-tts-panel-inner textarea,
+.minimax-tts-editor-dialog textarea {
+    background: rgba(0, 0, 0, 0.25) !important;
+    color: var(--SmartThemeBodyColor, #eee) !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    border-radius: 6px !important;
+    padding: 8px !important;
+    resize: vertical !important;
+}
+
+/* 复选框容器：增加一点间距 */
+.minimax-quote-tts-panel-inner .checkbox-container {
+    display: flex; align-items: center; gap: 6px; height: 32px;
+}
+
+/* 按钮强制横排且不被挤压 */
+.menu_button {
+    white-space: nowrap !important;
+    writing-mode: horizontal-tb !important;
+    display: inline-flex !important;
+    align-items: center !important; justify-content: center !important;
+}
+
+/* 标题样式：移除蓝色，融入酒馆主题 */
+.minimax-quote-tts-panel-inner .minimax-quote-tts-section-title {
+    margin: 5px 0 8px 0; display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px;
+    font-size: 1rem; color: inherit; /* 融入主题色 */
+    opacity: 0.9;
+}
+
+.mes_quote_tts.ready { color: #5bc46a !important; }
+
+/* 弹窗编辑器终极对齐 - 强力无视主题干扰 */
+.minimax-tts-editor-mask {
+    position: fixed !important; inset: 0 !important; 
+    width: 100vw !important; height: 100vh !important;
+    background: rgba(0, 0, 0, 0.8) !important;
+    z-index: 999999 !important; /* 顶级图层 */
+    display: flex !important; justify-content: center !important; align-items: center !important;
+    backdrop-filter: blur(5px) !important;
+    margin: 0 !important; padding: 0 !important;
+}
+
+.minimax-tts-editor-dialog {
+    width: 95% !important; max-width: 800px !important;
+    height: 80% !important; /* 强制锁定高度防止超出 */
+    background: var(--SmartThemeBlurTintColor, #1f2430) !important;
+    border: 1px solid var(--SmartThemeBorderColor, #3a4050) !important;
+    border-radius: 16px !important; padding: 20px !important;
+    display: flex !important; flex-direction: column !important;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.8) !important;
+}
+
+.minimax-tts-editor-header { 
+    display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important;
+    justify-content: space-between !important; align-items: center !important;
+    border-bottom: 1px solid rgba(255,255,255,0.1) !important;
+    padding-bottom: 12px !important; margin-bottom: 12px !important;
+    flex-shrink: 0 !important; width: 100% !important;
+}
+
+.minimax-tts-editor-body { overflow-y: auto !important; flex: 1 !important; padding-right: 10px !important; }
+
+.minimax-tts-editor-item {
+    background: rgba(255,255,255,0.04) !important; padding: 12px !important; 
+    border-radius: 10px !important; margin-bottom: 12px !important;
+}
+
+.minimax-tts-editor-grid {
+    display: grid !important; grid-template-columns: repeat(3, 1fr) !important; gap: 10px !important; margin-top: 10px !important;
+}
+
+@media screen and (max-width: 600px) {
+    .minimax-tts-editor-grid { grid-template-columns: repeat(2, 1fr) !important; }
+}
+
+.minimax-tts-editor-actions {
+    display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 15px !important;
+    border-top: 1px solid rgba(255,255,255,0.1) !important;
+    padding-top: 15px !important; margin-top: 10px !important;
+    flex-shrink: 0 !important;
+}
