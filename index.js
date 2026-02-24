@@ -352,7 +352,12 @@ function createUi() {
         } catch(e){ toastr.error(e.message); }
     });
     $('#m_test_minimax').on('click', async () => {
-        try { const b = await synthesizeSpeech('你好', { model: s().model, voiceId: s().voiceId, speed: s().speed, vol: s().vol, pitch: s().pitch, audioFormat: s().audioFormat }, `test_${Date.now()}`); new Audio(URL.createObjectURL(b.blob)).play(); toastr.success('语音连通成功！'); } catch(e){ toastr.error(e.message); }
+        try {
+            const item = { text: '你好', options: buildSynthesisOptions(null, null), serverPath: null };
+            const blob = await getAudioBlob(item);
+            new Audio(URL.createObjectURL(blob)).play();
+            toastr.success('语音连通成功！');
+        } catch(e) { toastr.error(e.message); }
     });
     $('#m_add_b').on('click', () => { const c = getContext(), id = c.characterId || c.character_id || c.name2 || 'global'; if (!s().characterBindingsMap[id]) s().characterBindingsMap[id] = []; s().characterBindingsMap[id].push({ targetType: 'custom', customName: '', voiceId: '', model: s().model }); renderB(); sync(); });
 
