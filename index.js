@@ -5,7 +5,12 @@ import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 const MODULE_NAME = 'minimax_quote_tts';
 const PROXY_ENDPOINT = '/api/minimax/generate-voice';
 const LLM_PROXY = '/api/minimax/proxy';
-const DEFAULT_API_HOST = 'https://api.minimax.io';
+const DEFAULT_API_HOST = 'https://api.minimax.chat';
+const API_HOST_OPTIONS = [
+    { value: 'https://api.minimax.chat',   label: '国内源 (api.minimax.chat)' },
+    { value: 'https://api.minimax.io',     label: '国际源 (api.minimax.io)' },
+    { value: 'https://api.minimaxi.chat',  label: '备用源 (api.minimaxi.chat)' },
+];
 
 const TARGET_TYPE = { CURRENT_CHARACTER: 'current_character', CURRENT_USER: 'current_user', CUSTOM: 'custom' };
 const API_FORMATS = { OAI: 'openai', GOOGLE: 'google' };
@@ -16,7 +21,7 @@ const MODEL_OPTIONS = [
 ];
 
 const defaults = {
-    enabled: true, autoPlay: true, showMessageButton: true, onlyCharacter: true,
+    enabled: true, autoPlay: true, showMessageButton: true, onlyCharacter: true, quoteOnly: true,
     apiKey: '', groupId: '', apiHost: DEFAULT_API_HOST, model: 'speech-02-hd', voiceId: 'male-qn-qingse',
     speed: 1, vol: 1, pitch: 0, emotion: '', audioFormat: 'mp3',
     maxQuotesPerMessage: 4, minLength: 1, maxLength: 300, ignoreCodeBlocks: true,
@@ -104,7 +109,11 @@ async function getAudioBlob(item) {
             apiKey: (set.apiKey || '').trim(), groupId: (set.groupId || '').trim(),
         }),
     });
-    if (!res.ok) throw new Error('API 失败');
+    if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { const e = await res.json(); msg = e.error || e.message || msg; } catch (_) {}
+        throw new Error(msg);
+    }
     const blob = await res.blob(); localAudioCache.set(cacheKey, blob);
     uploadToSTServer(blob, `${cacheKey}.${item.options.audioFormat}`).then(path => { if (path) { item.serverPath = path; saveSettingsDebounced(); } });
     return blob;
@@ -176,12 +185,16 @@ async function generateMessageSpeech(id, forced = false) {
             raw = await formatWithSecondaryApi(message);
         } else {
             const cleanText = message.mes.replace(/```[\s\S]*?```/g, ' ');
-            const quoteRegex = /[“””「『]([^”””「」『』\n]+)[“””」』]/g;
+            // 支持常见引号：” “(ASCII直引号) “ “(中文弯引号) 「」『』 ''，允许内容跨行，最长 500 字
+            // \u0022=英文直引号 \u201c\u201d=中文左右弯引号 \u300c\u300d=「」 \u300e\u300f=『』 \u2018\u2019=''
+            const quoteRegex = /[\u0022\u201c\u300c\u300e\u2018]([^\u0022\u201c\u201d\u300c\u300d\u300e\u300f\u2018\u2019]{1,500}?)[\u0022\u201d\u300d\u300f\u2019]/g;
             const segments = []; let qm;
             while ((qm = quoteRegex.exec(cleanText)) !== null) {
-                if (qm[1].trim()) segments.push({ text: qm[1].trim(), speaker: message.name });
+                const t = qm[1].replace(/\n+/g, ' ').trim();
+                if (t) segments.push({ text: t, speaker: message.name });
             }
-            raw = segments.length ? segments : [{ text: message.mes, speaker: message.name }];
+            if (!segments.length && !s().quoteOnly) segments.push({ text: message.mes, speaker: message.name });
+            raw = segments;
         }
         const items = raw.map(seg => ({ text: seg.text, speaker: seg.speaker || message.name, options: buildSynthesisOptions(seg, message), serverPath: null }));
         if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
@@ -234,6 +247,7 @@ function openParamsEditor(id) {
                 <div style="display:flex; gap:10px; align-items:center; justify-content:center; flex:1">
                     <button class="menu_button v-prev" style="width:40px;"> < </button>
                     <button class="menu_button v-next" style="width:40px;"> > </button>
+                    <button class="menu_button v-del" style="color:#ef5350;" title="删除此版本">删除</button>
                 </div>
                 <div style="text-align:right;"><button class="menu_button editor-close">关闭面板</button></div>
             </div>
@@ -246,6 +260,19 @@ function openParamsEditor(id) {
         $('#minimax_quote_tts_editor').remove(); $('body').append(html);
         $('#minimax_quote_tts_editor .v-prev').on('click', () => { if(h.activeIndex>0){ h.activeIndex--; render(); } });
         $('#minimax_quote_tts_editor .v-next').on('click', () => { if(h.activeIndex<h.versions.length-1){ h.activeIndex++; render(); } });
+        $('#minimax_quote_tts_editor .v-del').on('click', () => {
+            if (h.versions.length <= 1) {
+                // 最后一个版本也删掉，清空整条记录
+                delete s().serverHistory[key];
+                saveSettingsDebounced(); refreshAllMessageButtons();
+                $('#minimax_quote_tts_editor').remove();
+                return;
+            }
+            h.versions.splice(h.activeIndex, 1);
+            h.activeIndex = Math.min(h.activeIndex, h.versions.length - 1);
+            saveSettingsDebounced(); refreshAllMessageButtons();
+            render();
+        });
         $('#minimax_quote_tts_editor .editor-close').on('click', () => $('#minimax_quote_tts_editor').remove());
         $('#minimax_quote_tts_editor .edit-v').on('change input', function(){ 
             const p = $(this).data('prop'), idx = $(this).data('idx'), val = $(this).val();
@@ -266,11 +293,13 @@ function createUi() {
             <div class="minimax-quote-tts-section-title"><b>MiniMax 配置</b></div>
             <div class="minimax-quote-tts-row"><label>API Key</label><input id="m_key" class="text_pole" type="password"></div>
             <div class="minimax-quote-tts-row"><label>Group ID</label><input id="m_gid" class="text_pole" type="text"></div>
+            <div class="minimax-quote-tts-row"><label>API 节点</label><select id="m_apihost" class="text_pole">${API_HOST_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
             <div class="minimax-quote-tts-row"><label>默认模型</label><select id="m_model" class="text_pole">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
             <div class="minimax-quote-tts-row"><label>默认语音ID</label><input id="m_voice" class="text_pole" type="text"></div>
             <div class="minimax-quote-tts-row"><label>基础语速</label><input id="m_speed" class="text_pole" type="number" step="0.1"></div>
             <div class="minimax-quote-tts-row"><label>基础音量</label><input id="m_vol" class="text_pole" type="number" step="0.1"></div>
             <div class="minimax-quote-tts-row"><label>自动播放</label><div class="checkbox-container"><input id="m_autoplay" type="checkbox"></div></div>
+            <div class="minimax-quote-tts-row"><label>仅读引号</label><div class="checkbox-container"><input id="m_quoteonly" type="checkbox"><span style="font-size:0.78rem; opacity:0.55; margin-left:4px">无引号内容时跳过（不读正文）</span></div></div>
             <div class="minimax-quote-tts-row"><button id="m_test_minimax" class="menu_button">测试 MiniMax 语音</button></div>
             <hr>
             <div class="minimax-quote-tts-section-title"><b>副 API 格式化 (LLM)</b> <div class="checkbox-container"><input id="m_f_en" type="checkbox"> &nbsp;开启</div></div>
@@ -290,8 +319,8 @@ function createUi() {
     const upPresets = () => { selP.empty().append('<option value="-1">-- 新建预设 --</option>'); s().formatterPresets.forEach((p, i) => selP.append(`<option value="${i}">${p.name}</option>`)); };
     const upTemplates = () => { selT.empty().append('<option value="-1">-- 新建模板 --</option>'); s().formatterTemplates.forEach((t, i) => selT.append(`<option value="${i}">${t.name}</option>`)); };
     const sync = () => {
-        const set = s(); set.apiKey = $('#m_key').val(); set.groupId = $('#m_gid').val(); set.model = $('#m_model').val();
-        set.voiceId = $('#m_voice').val(); set.speed = Number($('#m_speed').val()); set.vol = Number($('#m_vol').val()); set.autoPlay = $('#m_autoplay').prop('checked');
+        const set = s(); set.apiKey = $('#m_key').val(); set.groupId = $('#m_gid').val(); set.apiHost = $('#m_apihost').val(); set.model = $('#m_model').val();
+        set.voiceId = $('#m_voice').val(); set.speed = Number($('#m_speed').val()); set.vol = Number($('#m_vol').val()); set.autoPlay = $('#m_autoplay').prop('checked'); set.quoteOnly = $('#m_quoteonly').prop('checked');
         set.formatterEnabled = $('#m_f_en').prop('checked'); set.formatterFormat = $('#m_f_format').val();
         set.formatterApiUrl = $('#m_f_url').val(); set.formatterApiKey = $('#m_f_key').val();
         set.formatterModel = ($('#m_f_model_sel').is(':visible') ? $('#m_f_model_sel').val() : $('#m_f_model').val());
@@ -362,8 +391,8 @@ function createUi() {
     $('#m_add_b').on('click', () => { const c = getContext(), id = c.characterId || c.character_id || c.name2 || 'global'; if (!s().characterBindingsMap[id]) s().characterBindingsMap[id] = []; s().characterBindingsMap[id].push({ targetType: 'custom', customName: '', voiceId: '', model: s().model }); renderB(); sync(); });
 
     loadSettings();
-    $('#m_key').val(s().apiKey); $('#m_gid').val(s().groupId); $('#m_voice').val(s().voiceId); $('#m_model').val(s().model);
-    $('#m_speed').val(s().speed); $('#m_vol').val(s().vol); $('#m_autoplay').prop('checked', s().autoPlay);
+    $('#m_key').val(s().apiKey); $('#m_gid').val(s().groupId); $('#m_apihost').val(s().apiHost || DEFAULT_API_HOST); $('#m_voice').val(s().voiceId); $('#m_model').val(s().model);
+    $('#m_speed').val(s().speed); $('#m_vol').val(s().vol); $('#m_autoplay').prop('checked', s().autoPlay); $('#m_quoteonly').prop('checked', s().quoteOnly !== false);
     $('#m_f_en').prop('checked', s().formatterEnabled); $('#m_f_format').val(s().formatterFormat);
     $('#m_f_url').val(s().formatterApiUrl); $('#m_f_key').val(s().formatterApiKey);
     $('#m_f_model').val(s().formatterModel); $('#m_f_prompt').val(s().formatterSystemPrompt);
@@ -378,7 +407,7 @@ jQuery(async () => {
     
     // --- 自动播放监听 ---
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (id) => {
-        if (s().enabled && s().autoPlay) {
+        if (s().enabled && s().autoPlay && !vcActive) {
             console.log('[MiniMax语音] 检测到新消息，准备自动播放:', id);
             if (await generateMessageSpeech(id, false)) {
                 playGeneratedMessage(id);
