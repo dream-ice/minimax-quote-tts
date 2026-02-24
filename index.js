@@ -171,7 +171,18 @@ async function generateMessageSpeech(id, forced = false) {
     const { message, key } = getMessageData(id); if (!message || (s().onlyCharacter && message.is_user)) return false;
     let h = s().serverHistory[key]; if (!forced && h?.versions?.length) return true;
     try {
-        const raw = s().formatterEnabled ? await formatWithSecondaryApi(message) : message.mes.replace(/```[\s\S]*?```/g, ' ').match(/[^\s"“”「」『』]+(?=["“”「」『』])/g)?.map(t => ({ text: t, speaker: message.name })) || [{ text: message.mes, speaker: message.name }];
+        let raw;
+        if (s().formatterEnabled) {
+            raw = await formatWithSecondaryApi(message);
+        } else {
+            const cleanText = message.mes.replace(/```[\s\S]*?```/g, ' ');
+            const quoteRegex = /[“””「『]([^”””「」『』\n]+)[“””」』]/g;
+            const segments = []; let qm;
+            while ((qm = quoteRegex.exec(cleanText)) !== null) {
+                if (qm[1].trim()) segments.push({ text: qm[1].trim(), speaker: message.name });
+            }
+            raw = segments.length ? segments : [{ text: message.mes, speaker: message.name }];
+        }
         const items = raw.map(seg => ({ text: seg.text, speaker: seg.speaker || message.name, options: buildSynthesisOptions(seg, message), serverPath: null }));
         if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
         s().serverHistory[key].versions.push({ items, timestamp: Date.now() });
