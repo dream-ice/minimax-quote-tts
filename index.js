@@ -1,5 +1,6 @@
 import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
+import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 
 const MODULE_NAME = 'minimax_quote_tts';
 const PROXY_ENDPOINT = '/api/minimax/generate-voice';
@@ -54,7 +55,7 @@ function getMessageData(id) {
 
 function normalizeOaiUrl(url) {
     let u = (url || '').trim().replace(/\/+$/, ''); if (!u) return '';
-    if (!u.endsWith('/chat/completions') && !u.includes('google')) u += '/chat/completions';
+    if (!u.endsWith('/chat/completions')) u += '/chat/completions';
     return u;
 }
 
@@ -135,8 +136,10 @@ async function formatWithSecondaryApi(m) {
             });
             text = data.choices?.[0]?.message?.content;
         } else {
-            const gUrl = `https://generativelanguage.googleapis.com/v1beta/models/${set.formatterModel}:generateContent?key=${set.formatterApiKey.trim()}`;
-            const data = await proxyFetch(gUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: { contents: [{ role: 'user', parts: [{ text: `System Prompt: ${prompt}\n\nUser Message: ${m.mes}` }] }] } });
+            const baseUrl = (set.formatterApiUrl || '').trim().replace(/\/+$/, '');
+            const gUrl = `${baseUrl}/v1beta/models/${set.formatterModel}:generateContent`;
+            const gHeaders = { 'Content-Type': 'application/json', ...(set.formatterApiKey ? { 'x-goog-api-key': set.formatterApiKey.trim() } : {}) };
+            const data = await proxyFetch(gUrl, { method: 'POST', headers: gHeaders, body: { contents: [{ role: 'user', parts: [{ text: `System Prompt: ${prompt}\n\nUser Message: ${m.mes}` }] }] } });
             text = data.candidates?.[0]?.content?.parts?.[0]?.text;
         }
         const match = text.match(/\{[\s\S]*\}/); if (!match) throw new Error('AI 无有效 JSON');
@@ -250,23 +253,23 @@ function createUi() {
     <div class="inline-drawer-toggle inline-drawer-header"><b>MiniMax语音</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
     <div class="inline-drawer-content"><div class="minimax-quote-tts-panel-inner" style="padding:10px;">
             <div class="minimax-quote-tts-section-title"><b>MiniMax 配置</b></div>
-            <div class="minimax-quote-tts-row"><label>API Key</label><input id="m_key" type="password"></div>
-            <div class="minimax-quote-tts-row"><label>Group ID</label><input id="m_gid" type="text"></div>
-            <div class="minimax-quote-tts-row"><label>默认模型</label><select id="m_model">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
-            <div class="minimax-quote-tts-row"><label>默认语音ID</label><input id="m_voice" type="text"></div>
-            <div class="minimax-quote-tts-row"><label>基础语速</label><input id="m_speed" type="number" step="0.1"></div>
-            <div class="minimax-quote-tts-row"><label>基础音量</label><input id="m_vol" type="number" step="0.1"></div>
+            <div class="minimax-quote-tts-row"><label>API Key</label><input id="m_key" class="text_pole" type="password"></div>
+            <div class="minimax-quote-tts-row"><label>Group ID</label><input id="m_gid" class="text_pole" type="text"></div>
+            <div class="minimax-quote-tts-row"><label>默认模型</label><select id="m_model" class="text_pole">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
+            <div class="minimax-quote-tts-row"><label>默认语音ID</label><input id="m_voice" class="text_pole" type="text"></div>
+            <div class="minimax-quote-tts-row"><label>基础语速</label><input id="m_speed" class="text_pole" type="number" step="0.1"></div>
+            <div class="minimax-quote-tts-row"><label>基础音量</label><input id="m_vol" class="text_pole" type="number" step="0.1"></div>
             <div class="minimax-quote-tts-row"><label>自动播放</label><div class="checkbox-container"><input id="m_autoplay" type="checkbox"></div></div>
             <div class="minimax-quote-tts-row"><button id="m_test_minimax" class="menu_button">测试 MiniMax 语音</button></div>
             <hr>
             <div class="minimax-quote-tts-section-title"><b>副 API 格式化 (LLM)</b> <div class="checkbox-container"><input id="m_f_en" type="checkbox"> &nbsp;开启</div></div>
-            <div class="minimax-quote-tts-row"><label>配置预设</label><select id="m_f_presets"></select><button id="m_f_save_p" class="menu_button">保存</button><button id="m_f_upd_p" class="menu_button">更新</button><button id="m_f_del_p" class="menu_button">删除</button></div>
-            <div class="minimax-quote-tts-row"><label>接口格式</label><select id="m_f_format"><option value="${API_FORMATS.OAI}">OpenAI</option><option value="${API_FORMATS.GOOGLE}">Google Gemini</option></select></div>
-            <div class="minimax-quote-tts-row"><label>API 地址</label><input id="m_f_url" type="text"></div>
-            <div class="minimax-quote-tts-row"><label>API 密钥</label><input id="m_f_key" type="password"></div>
-            <div class="minimax-quote-tts-row"><label>AI 模型</label><input id="m_f_model" type="text"><select id="m_f_model_sel" style="display:none"></select><button id="m_f_fetch" class="menu_button">获取</button><button id="m_f_test_conn" class="menu_button">测试</button></div>
-            <div class="minimax-quote-tts-row"><label>提示词模板</label><select id="m_f_templates"></select><button id="m_f_save_t" class="menu_button">保存</button><button id="m_f_upd_t" class="menu_button">更新</button><button id="m_f_del_t" class="menu_button">删除</button></div>
-            <div class="minimax-quote-tts-row"><label>提示词</label><textarea id="m_f_prompt"></textarea></div>
+            <div class="minimax-quote-tts-row"><label>配置预设</label><select id="m_f_presets" class="text_pole"></select><button id="m_f_save_p" class="menu_button">保存</button><button id="m_f_upd_p" class="menu_button">更新</button><button id="m_f_del_p" class="menu_button">删除</button></div>
+            <div class="minimax-quote-tts-row"><label>接口格式</label><select id="m_f_format" class="text_pole"><option value="${API_FORMATS.OAI}">OpenAI</option><option value="${API_FORMATS.GOOGLE}">Google Gemini</option></select></div>
+            <div class="minimax-quote-tts-row"><label>API 地址</label><input id="m_f_url" class="text_pole" type="text"></div>
+            <div class="minimax-quote-tts-row"><label>API 密钥</label><input id="m_f_key" class="text_pole" type="password"></div>
+            <div class="minimax-quote-tts-row"><label>AI 模型</label><input id="m_f_model" class="text_pole" type="text"><select id="m_f_model_sel" class="text_pole" style="display:none"></select><button id="m_f_fetch" class="menu_button">获取</button><button id="m_f_test_conn" class="menu_button">测试</button></div>
+            <div class="minimax-quote-tts-row"><label>提示词模板</label><select id="m_f_templates" class="text_pole"></select><button id="m_f_save_t" class="menu_button">保存</button><button id="m_f_upd_t" class="menu_button">更新</button><button id="m_f_del_t" class="menu_button">删除</button></div>
+            <div class="minimax-quote-tts-row"><label>提示词</label><textarea id="m_f_prompt" class="text_pole"></textarea><button id="m_f_prompt_expand" class="menu_button" title="展开编辑"><i class="fa-solid fa-expand"></i></button></div>
             <hr>
             <div class="minimax-quote-tts-section-title"><b>角色绑定 (当前角色专用)</b> <button id="m_add_b" class="menu_button">添加绑定</button></div>
             <div id="m_b_rows"></div>
@@ -310,17 +313,32 @@ function createUi() {
     $('#m_f_upd_t').on('click', () => { const i = selT.val(); if(i >= 0) { s().formatterTemplates[i].content = s().formatterSystemPrompt; toastr.success('更新成功'); sync(); } });
     $('#m_f_del_t').on('click', () => { const i = selT.val(); if(i >= 0) { s().formatterTemplates.splice(i, 1); upTemplates(); sync(); } });
     selT.on('change', function() { const t = s().formatterTemplates[$(this).val()]; if (t) { $('#m_f_prompt').val(t.content); sync(); } });
+    $('#m_f_prompt_expand').on('click', async () => {
+        const result = await callGenericPopup('编辑提示词', POPUP_TYPE.INPUT, $('#m_f_prompt').val(), { rows: 15, wide: true });
+        if (result !== null && result !== false) { $('#m_f_prompt').val(result); sync(); }
+    });
     $('#m_f_fetch').on('click', async () => {
         const set = s(), url = set.formatterApiUrl.trim().replace(/\/chat\/completions$/, '').replace(/\/+$/, '');
         try {
             let m = []; if (set.formatterFormat === API_FORMATS.OAI) { const d = await proxyFetch(`${url}/models`, { headers: set.formatterApiKey ? { 'Authorization': `Bearer ${set.formatterApiKey.trim()}` } : {} }); m = d.data?.map(it => typeof it === 'string' ? it : it.id) || []; }
-            else { const d = await proxyFetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${set.formatterApiKey.trim()}`); m = d.models?.map(it => it.name.replace('models/', '')) || []; }
+            else { const d = await proxyFetch(`${url}/v1beta/models`, { headers: set.formatterApiKey ? { 'x-goog-api-key': set.formatterApiKey.trim() } : {} }); m = d.models?.map(it => it.name.replace('models/', '')) || []; }
             if (m.length) { const sel = $('#m_f_model_sel').empty().show(); $('#m_f_model').hide(); m.forEach(it => sel.append(`<option value="${it}">${it}</option>`)); sel.val(m[0]); sync(); toastr.success('获取成功'); }
         } catch(e){ toastr.error(e.message); }
     });
     $('#m_f_test_conn').on('click', async () => {
-        try { const url = normalizeOaiUrl(s().formatterApiUrl); const d = await proxyFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: { model: s().formatterModel, messages: [{ role: 'user', content: 'Say connected' }], temperature: 0.1 } });
-        if(d) toastr.success('API 连通成功！'); } catch(e){ toastr.error(e.message); }
+        try {
+            const set = s(); let d;
+            if (set.formatterFormat === API_FORMATS.OAI) {
+                const url = normalizeOaiUrl(set.formatterApiUrl);
+                d = await proxyFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(set.formatterApiKey ? { 'Authorization': `Bearer ${set.formatterApiKey.trim()}` } : {}) }, body: { model: set.formatterModel, messages: [{ role: 'user', content: 'Say connected' }], temperature: 0.1 } });
+            } else {
+                const baseUrl = (set.formatterApiUrl || '').trim().replace(/\/+$/, '');
+                const url = `${baseUrl}/v1beta/models/${set.formatterModel}:generateContent`;
+                const headers = { 'Content-Type': 'application/json', ...(set.formatterApiKey ? { 'x-goog-api-key': set.formatterApiKey.trim() } : {}) };
+                d = await proxyFetch(url, { method: 'POST', headers, body: { contents: [{ role: 'user', parts: [{ text: 'Say connected' }] }] } });
+            }
+            if(d) toastr.success('API 连通成功！');
+        } catch(e){ toastr.error(e.message); }
     });
     $('#m_test_minimax').on('click', async () => {
         try { const b = await synthesizeSpeech('你好', { model: s().model, voiceId: s().voiceId, speed: s().speed, vol: s().vol, pitch: s().pitch, audioFormat: s().audioFormat }, `test_${Date.now()}`); new Audio(URL.createObjectURL(b.blob)).play(); toastr.success('语音连通成功！'); } catch(e){ toastr.error(e.message); }
