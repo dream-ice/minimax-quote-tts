@@ -106,7 +106,7 @@ async function getAudioBlob(item) {
     });
     if (!res.ok) throw new Error('API 失败');
     const blob = await res.blob(); localAudioCache.set(cacheKey, blob);
-    uploadToSTServer(blob, `${cacheKey}.${item.options.audioFormat}`).then(path => { if(path) item.serverPath = path; });
+    uploadToSTServer(blob, `${cacheKey}.${item.options.audioFormat}`).then(path => { if (path) { item.serverPath = path; saveSettingsDebounced(); } });
     return blob;
 }
 
@@ -194,7 +194,7 @@ async function generateMessageSpeech(id, forced = false) {
 async function playGeneratedMessage(id) {
     const { key } = getMessageData(id); const h = s().serverHistory[key];
     if (!h?.versions[h.activeIndex]) return false;
-    playbackQueue = [...JSON.parse(JSON.stringify(h.versions[h.activeIndex].items))];
+    playbackQueue = [...h.versions[h.activeIndex].items];
     activeAudio.pause(); activeAudio.src = '';
     if (!isPlaying) playNext();
     setTimeout(() => saveSettingsDebounced(), 2000);
