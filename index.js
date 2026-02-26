@@ -1,4 +1,4 @@
-import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced, addOneMessage, saveChatDebounced } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 
@@ -21,14 +21,19 @@ const MODEL_OPTIONS = [
 ];
 
 const defaults = {
-    enabled: true, autoPlay: true, showMessageButton: true, onlyCharacter: true, quoteOnly: true,
+    enabled: true, autoPlay: true, showMessageButton: true, onlyCharacter: true,
     apiKey: '', groupId: '', apiHost: DEFAULT_API_HOST, model: 'speech-02-hd', voiceId: 'male-qn-qingse',
     speed: 1, vol: 1, pitch: 0, emotion: '', audioFormat: 'mp3',
     maxQuotesPerMessage: 4, minLength: 1, maxLength: 300, ignoreCodeBlocks: true,
-    characterBindingsMap: {}, formatterPresets: [], formatterTemplates: [],
-    formatterEnabled: false, formatterApiUrl: '', formatterApiKey: '', formatterModel: '', formatterFormat: API_FORMATS.OAI,
+    characterBindingsMap: {}, llmPresets: [], formatterTemplates: [],
+    formatterEnabled: false, formatterPresetIdx: -1,
     formatterSystemPrompt: '请以严格的 JSON 格式返回：{"segments":[{"text":"...","speaker":"...","emotion":"...","speed":1.0,"vol":1.0,"pitch":0}]}. 仅保留可朗读的内容。',
     serverHistory: {},
+    voiceLibrary: [],          // [{name, voiceId}] 语音库
+    regexRules: [],            // [{id, enabled, name, pattern, flags, mode}] mode:'extract'|'exclude'
+    regexPresets: [],          // [{name, rules:[...]}]
+    vcPromptBlocks: null,      // null = 默认顺序
+    vcPromptTemplates: [],     // [{name, blocks:[...], systemPrompt:''}]
 };
 
 let playbackQueue = [], isPlaying = false, clickTimer = null;
@@ -37,10 +42,58 @@ const localAudioCache = new Map();
 
 function s() { return extension_settings[MODULE_NAME]; }
 
+function escHtml(v) { return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function getBuiltinQuoteRule() {
+    return {
+        id: 'builtin-quotes', enabled: true, name: '引号内容',
+        pattern: '[\\u0022\\u201c\\u300c\\u300e\\u2018]([^\\u0022\\u201c\\u201d\\u300c\\u300d\\u300e\\u300f\\u2018\\u2019]{1,500}?)[\\u0022\\u201d\\u300d\\u300f\\u2019]',
+        flags: 'g', mode: 'extract',
+    };
+}
+
 function loadSettings() {
     extension_settings[MODULE_NAME] = extension_settings[MODULE_NAME] || {};
     const settings = extension_settings[MODULE_NAME];
     for (const key in defaults) { if (settings[key] === undefined) settings[key] = JSON.parse(JSON.stringify(defaults[key])); }
+    // 迁移：旧版 formatterPresets → llmPresets
+    if (settings.formatterPresets?.length > 0 && settings.llmPresets.length === 0) {
+        settings.llmPresets = settings.formatterPresets.map(p => ({ name: p.name, url: p.url || '', key: p.key || '', format: p.format || API_FORMATS.OAI, model: p.model || '' }));
+    }
+    // 迁移：旧版独立字段 → 第一个预设
+    if (!settings.llmPresets.length && (settings.formatterApiUrl || settings.vcLlmApiUrl)) {
+        const url = settings.formatterApiUrl || settings.vcLlmApiUrl || '';
+        const key = settings.formatterApiKey || settings.vcLlmApiKey || '';
+        const model = settings.formatterModel || settings.vcLlmModel || '';
+        if (url || model) {
+            settings.llmPresets.push({ name: '迁移预设', url, key, format: settings.formatterFormat || API_FORMATS.OAI, model });
+            settings.formatterPresetIdx = 0;
+        }
+    }
+    // 迁移：初始化 regexRules（新安装 or 旧版升级）
+    if (!Array.isArray(settings.regexRules) || settings.regexRules.length === 0) {
+        settings.regexRules = [getBuiltinQuoteRule()];
+        // 如果旧版有自定义正则，迁移为第二条规则
+        if (settings.customRegexPattern && settings.regexMode === 'custom') {
+            settings.regexRules.push({
+                id: 'migrated-' + Date.now(), enabled: true, name: '迁移正则',
+                pattern: settings.customRegexPattern, flags: settings.customRegexFlags || 'g', mode: 'extract',
+            });
+        }
+    }
+    // 迁移：为已存储的 vcPromptBlocks 补充缺失的 worldBook 块
+    if (Array.isArray(settings.vcPromptBlocks) && !settings.vcPromptBlocks.some(b => b.id === 'worldBook')) {
+        const worldBookBlock = { id: 'worldBook', enabled: false, label: '世界书', editable: false, hint: '（世界书注入内容' };
+        const afterIdx = settings.vcPromptBlocks.findIndex(b => b.id === 'charDesc');
+        if (afterIdx >= 0) settings.vcPromptBlocks.splice(afterIdx + 1, 0, worldBookBlock);
+        else settings.vcPromptBlocks.unshift(worldBookBlock);
+    }
+    // 清理旧字段
+    delete settings.quoteOnly;
+    delete settings.regexMode;
+    delete settings.customRegexPattern;
+    delete settings.customRegexFlags;
+    delete settings.customRegexPresets;
 }
 
 function simpleHash(t) {
@@ -123,6 +176,8 @@ async function getAudioBlob(item) {
 async function playNext() {
     if (playbackQueue.length === 0) { isPlaying = false; return; }
     isPlaying = true; const item = playbackQueue.shift();
+    // 停顿标记：item.pauseMs 存在时静默等待，用于通话回放中两轮回话之间的间隔
+    if (item.pauseMs) { await new Promise(r => setTimeout(r, item.pauseMs)); playNext(); return; }
     try {
         const blob = await getAudioBlob(item);
         const url = URL.createObjectURL(blob);
@@ -134,20 +189,23 @@ async function playNext() {
 }
 
 async function formatWithSecondaryApi(m) {
-    const set = s(), format = set.formatterFormat, prompt = set.formatterSystemPrompt;
-    let url = normalizeOaiUrl(set.formatterApiUrl);
+    const set = s();
+    const preset = (set.llmPresets || [])[set.formatterPresetIdx];
+    if (!preset) throw new Error('请先在「LLM 预设管理」中选择一个预设');
+    const format = preset.format || API_FORMATS.OAI, prompt = set.formatterSystemPrompt;
     try {
         let text;
         if (format === API_FORMATS.OAI) {
+            const url = normalizeOaiUrl(preset.url);
             const data = await proxyFetch(url, {
-                method: 'POST', headers: { 'Content-Type': 'application/json', ...(set.formatterApiKey ? { 'Authorization': `Bearer ${set.formatterApiKey.trim()}` } : {}) },
-                body: { model: set.formatterModel, messages: [{ role: 'system', content: prompt }, { role: 'user', content: m.mes }], temperature: 0.1 }
+                method: 'POST', headers: { 'Content-Type': 'application/json', ...(preset.key ? { 'Authorization': `Bearer ${preset.key.trim()}` } : {}) },
+                body: { model: preset.model, messages: [{ role: 'system', content: prompt }, { role: 'user', content: m.mes }], temperature: 0.1 }
             });
             text = data.choices?.[0]?.message?.content;
         } else {
-            const baseUrl = (set.formatterApiUrl || '').trim().replace(/\/+$/, '');
-            const gUrl = `${baseUrl}/v1beta/models/${set.formatterModel}:generateContent`;
-            const gHeaders = { 'Content-Type': 'application/json', ...(set.formatterApiKey ? { 'x-goog-api-key': set.formatterApiKey.trim() } : {}) };
+            const baseUrl = (preset.url || '').trim().replace(/\/+$/, '');
+            const gUrl = `${baseUrl}/v1beta/models/${preset.model}:generateContent`;
+            const gHeaders = { 'Content-Type': 'application/json', ...(preset.key ? { 'x-goog-api-key': preset.key.trim() } : {}) };
             const data = await proxyFetch(gUrl, { method: 'POST', headers: gHeaders, body: { contents: [{ role: 'user', parts: [{ text: `System Prompt: ${prompt}\n\nUser Message: ${m.mes}` }] }] } });
             text = data.candidates?.[0]?.content?.parts?.[0]?.text;
         }
@@ -184,17 +242,28 @@ async function generateMessageSpeech(id, forced = false) {
         if (s().formatterEnabled) {
             raw = await formatWithSecondaryApi(message);
         } else {
-            const cleanText = message.mes.replace(/```[\s\S]*?```/g, ' ');
-            // 支持常见引号：” “(ASCII直引号) “ “(中文弯引号) 「」『』 ''，允许内容跨行，最长 500 字
-            // \u0022=英文直引号 \u201c\u201d=中文左右弯引号 \u300c\u300d=「」 \u300e\u300f=『』 \u2018\u2019=''
-            const quoteRegex = /[\u0022\u201c\u300c\u300e\u2018]([^\u0022\u201c\u201d\u300c\u300d\u300e\u300f\u2018\u2019]{1,500}?)[\u0022\u201d\u300d\u300f\u2019]/g;
-            const segments = []; let qm;
-            while ((qm = quoteRegex.exec(cleanText)) !== null) {
-                const t = qm[1].replace(/\n+/g, ' ').trim();
-                if (t) segments.push({ text: t, speaker: message.name });
+            const cleanText = s().ignoreCodeBlocks ? message.mes.replace(/```[\s\S]*?```/g, ' ') : message.mes;
+            const rules = (s().regexRules || []).filter(r => r.enabled);
+            if (!rules.length) {
+                raw = [];
+            } else {
+                // 先运行所有 extract 规则，收集要读的段落
+                let extracted = [];
+                for (const rule of rules.filter(r => r.mode === 'extract')) {
+                    let re; try { re = new RegExp(rule.pattern, 'g'); } catch(e) { continue; }
+                    let qm;
+                    while ((qm = re.exec(cleanText)) !== null) {
+                        const t = (qm[1]?.replace(/\n+/g, ' ').trim()) || (qm[0]?.replace(/\n+/g, ' ').trim());
+                        if (t) extracted.push({ text: t, speaker: message.name });
+                    }
+                }
+                // 再运行所有 exclude 规则，过滤掉匹配的段落
+                for (const rule of rules.filter(r => r.mode === 'exclude')) {
+                    let re; try { re = new RegExp(rule.pattern, 'g'); } catch(e) { continue; }
+                    extracted = extracted.filter(seg => !re.test(seg.text));
+                }
+                raw = extracted;
             }
-            if (!segments.length && !s().quoteOnly) segments.push({ text: message.mes, speaker: message.name });
-            raw = segments;
         }
         const items = raw.map(seg => ({ text: seg.text, speaker: seg.speaker || message.name, options: buildSynthesisOptions(seg, message), serverPath: null }));
         if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
@@ -285,120 +354,710 @@ function openParamsEditor(id) {
     }; render();
 }
 
+function refreshAllLlmPresetSelects() {
+    const presets = s().llmPresets || [];
+    const opts = '<option value="-1">-- 选择预设 --</option>' + presets.map((p, i) => `<option value="${i}">${p.name}</option>`).join('');
+    document.querySelectorAll('.llm-preset-sel').forEach(el => {
+        const cur = el.value;
+        el.innerHTML = opts;
+        if (Number(cur) >= 0 && Number(cur) < presets.length) el.value = cur;
+    });
+}
+
 function createUi() {
-    const html = `
-<div id="minimax_quote_tts_panel" class="inline-drawer">
-    <div class="inline-drawer-toggle inline-drawer-header"><b>MiniMax语音</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
-    <div class="inline-drawer-content"><div class="minimax-quote-tts-panel-inner" style="padding:10px;">
-            <div class="minimax-quote-tts-section-title"><b>MiniMax 配置</b></div>
-            <div class="minimax-quote-tts-row"><label>API Key</label><input id="m_key" class="text_pole" type="password"></div>
-            <div class="minimax-quote-tts-row"><label>Group ID</label><input id="m_gid" class="text_pole" type="text"></div>
-            <div class="minimax-quote-tts-row"><label>API 节点</label><select id="m_apihost" class="text_pole">${API_HOST_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
-            <div class="minimax-quote-tts-row"><label>默认模型</label><select id="m_model" class="text_pole">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
-            <div class="minimax-quote-tts-row"><label>默认语音ID</label><input id="m_voice" class="text_pole" type="text"></div>
-            <div class="minimax-quote-tts-row"><label>基础语速</label><input id="m_speed" class="text_pole" type="number" step="0.1"></div>
-            <div class="minimax-quote-tts-row"><label>基础音量</label><input id="m_vol" class="text_pole" type="number" step="0.1"></div>
-            <div class="minimax-quote-tts-row"><label>自动播放</label><div class="checkbox-container"><input id="m_autoplay" type="checkbox"></div></div>
-            <div class="minimax-quote-tts-row"><label>仅读引号</label><div class="checkbox-container"><input id="m_quoteonly" type="checkbox"><span style="font-size:0.78rem; opacity:0.55; margin-left:4px">无引号内容时跳过（不读正文）</span></div></div>
-            <div class="minimax-quote-tts-row"><button id="m_test_minimax" class="menu_button">测试 MiniMax 语音</button></div>
-            <hr>
-            <div class="minimax-quote-tts-section-title"><b>副 API 格式化 (LLM)</b> <div class="checkbox-container"><input id="m_f_en" type="checkbox"> &nbsp;开启</div></div>
-            <div class="minimax-quote-tts-row"><label>配置预设</label><select id="m_f_presets" class="text_pole"></select><button id="m_f_save_p" class="menu_button">保存</button><button id="m_f_upd_p" class="menu_button">更新</button><button id="m_f_del_p" class="menu_button">删除</button></div>
-            <div class="minimax-quote-tts-row"><label>接口格式</label><select id="m_f_format" class="text_pole"><option value="${API_FORMATS.OAI}">OpenAI</option><option value="${API_FORMATS.GOOGLE}">Google Gemini</option></select></div>
-            <div class="minimax-quote-tts-row"><label>API 地址</label><input id="m_f_url" class="text_pole" type="text"></div>
-            <div class="minimax-quote-tts-row"><label>API 密钥</label><input id="m_f_key" class="text_pole" type="password"></div>
-            <div class="minimax-quote-tts-row"><label>AI 模型</label><input id="m_f_model" class="text_pole" type="text"><select id="m_f_model_sel" class="text_pole" style="display:none"></select><button id="m_f_fetch" class="menu_button">获取</button><button id="m_f_test_conn" class="menu_button">测试</button></div>
-            <div class="minimax-quote-tts-row"><label>提示词模板</label><select id="m_f_templates" class="text_pole"></select><button id="m_f_save_t" class="menu_button">保存</button><button id="m_f_upd_t" class="menu_button">更新</button><button id="m_f_del_t" class="menu_button">删除</button></div>
-            <div class="minimax-quote-tts-row"><label>提示词</label><textarea id="m_f_prompt" class="text_pole"></textarea><button id="m_f_prompt_expand" class="menu_button" title="展开编辑"><i class="fa-solid fa-expand"></i></button></div>
-            <hr>
-            <div class="minimax-quote-tts-section-title"><b>角色绑定 (当前角色专用)</b> <button id="m_add_b" class="menu_button">添加绑定</button></div>
-            <div id="m_b_rows"></div>
-        </div></div></div>`;
-    $('#extensions_settings').append(html);
-    const selP = $('#m_f_presets'), selT = $('#m_f_templates');
-    const upPresets = () => { selP.empty().append('<option value="-1">-- 新建预设 --</option>'); s().formatterPresets.forEach((p, i) => selP.append(`<option value="${i}">${p.name}</option>`)); };
-    const upTemplates = () => { selT.empty().append('<option value="-1">-- 新建模板 --</option>'); s().formatterTemplates.forEach((t, i) => selT.append(`<option value="${i}">${t.name}</option>`)); };
-    const sync = () => {
-        const set = s(); set.apiKey = $('#m_key').val(); set.groupId = $('#m_gid').val(); set.apiHost = $('#m_apihost').val(); set.model = $('#m_model').val();
-        set.voiceId = $('#m_voice').val(); set.speed = Number($('#m_speed').val()); set.vol = Number($('#m_vol').val()); set.autoPlay = $('#m_autoplay').prop('checked'); set.quoteOnly = $('#m_quoteonly').prop('checked');
-        set.formatterEnabled = $('#m_f_en').prop('checked'); set.formatterFormat = $('#m_f_format').val();
-        set.formatterApiUrl = $('#m_f_url').val(); set.formatterApiKey = $('#m_f_key').val();
-        set.formatterModel = ($('#m_f_model_sel').is(':visible') ? $('#m_f_model_sel').val() : $('#m_f_model').val());
-        set.formatterSystemPrompt = $('#m_f_prompt').val(); saveSettingsDebounced();
-    };
-    const renderB = () => {
-        const c = getContext(), id = c.characterId || c.character_id || c.name2 || 'global';
-        if (!s().characterBindingsMap[id]) s().characterBindingsMap[id] = [];
-        $('#m_b_rows').empty();
-        s().characterBindingsMap[id].forEach((b, i) => {
-            const row = $(`<div style="display:grid; grid-template-columns:1.2fr 1fr 1fr 1fr auto; gap:4px; margin-bottom:4px; align-items:center;">
-                <select class="text_pole b-type"><option value="${TARGET_TYPE.CURRENT_CHARACTER}">${c.name2||'角色'}</option><option value="${TARGET_TYPE.CURRENT_USER}">${c.name1||'你'}</option><option value="${TARGET_TYPE.CUSTOM}">自定义</option></select>
-                <input class="text_pole b-name" placeholder="名" value="${b.customName||''}" style="${b.targetType==='custom'?'':'display:none'}">
-                <select class="text_pole b-model">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select>
-                <input class="text_pole b-voice" placeholder="ID" value="${b.voiceId}">
-                <button class="menu_button b-del">×</button>
-            </div>`);
-            row.find('.b-type').val(b.targetType).on('change', function(){ b.targetType=$(this).val(); renderB(); sync(); });
-            row.find('.b-name').on('input', function(){ b.customName=$(this).val(); sync(); });
-            row.find('.b-model').val(b.model || s().model).on('change', function(){ b.model=$(this).val(); sync(); });
-            row.find('.b-voice').on('input', function(){ b.voiceId=$(this).val(); sync(); });
-            row.find('.b-del').on('click', () => { s().characterBindingsMap[id].splice(i, 1); renderB(); sync(); }); $('#m_b_rows').append(row);
-        });
-    };
-    $('#m_f_save_p').on('click', () => { const n = prompt('预设名:'); if(!n) return; s().formatterPresets.push({name:n, url:s().formatterApiUrl, key:s().formatterApiKey, format:s().formatterFormat, model:s().formatterModel}); upPresets(); sync(); });
-    $('#m_f_upd_p').on('click', () => { const i = selP.val(); if(i >= 0) { s().formatterPresets[i] = { ...s().formatterPresets[i], url: s().formatterApiUrl, key: s().formatterApiKey, format: s().formatterFormat, model: s().formatterModel }; toastr.success('更新成功'); sync(); } });
-    $('#m_f_del_p').on('click', () => { const i = selP.val(); if(i >= 0) { s().formatterPresets.splice(i, 1); upPresets(); sync(); } });
-    selP.on('change', function() { const p = s().formatterPresets[$(this).val()]; if (!p) return; $('#m_f_url').val(p.url); $('#m_f_key').val(p.key); $('#m_f_format').val(p.format); $('#m_f_model').val(p.model).show(); $('#m_f_model_sel').hide(); sync(); });
-    $('#m_f_save_t').on('click', () => { const n = prompt('模板名:'); if(!n) return; s().formatterTemplates.push({name:n, content:s().formatterSystemPrompt}); upTemplates(); sync(); });
-    $('#m_f_upd_t').on('click', () => { const i = selT.val(); if(i >= 0) { s().formatterTemplates[i].content = s().formatterSystemPrompt; toastr.success('更新成功'); sync(); } });
-    $('#m_f_del_t').on('click', () => { const i = selT.val(); if(i >= 0) { s().formatterTemplates.splice(i, 1); upTemplates(); sync(); } });
-    selT.on('change', function() { const t = s().formatterTemplates[$(this).val()]; if (t) { $('#m_f_prompt').val(t.content); sync(); } });
-    $('#m_f_prompt_expand').on('click', async () => {
-        const result = await callGenericPopup('编辑提示词', POPUP_TYPE.INPUT, $('#m_f_prompt').val(), { rows: 15, wide: true });
-        if (result !== null && result !== false) { $('#m_f_prompt').val(result); sync(); }
+    // 在魔法棒菜单（左下角）添加入口
+    const wandHtml = `<div id="mm_wand_item" class="list-group-item flex-container flexGap5" title="MiniMax TTS 配置"><div class="fa-solid fa-volume-high extensionsMenuExtensionButton"></div>MiniMax语音</div>`;
+    $('#extensionsMenu').append(wandHtml);
+    $('#mm_wand_item').on('click', () => {
+        // 关闭魔法棒菜单
+        const menu = document.getElementById('extensionsMenu');
+        if (menu) menu.style.display = 'none';
+        openConfigPanel();
     });
-    $('#m_f_fetch').on('click', async () => {
-        const set = s(), url = set.formatterApiUrl.trim().replace(/\/chat\/completions$/, '').replace(/\/+$/, '');
-        try {
-            let m = []; if (set.formatterFormat === API_FORMATS.OAI) { const d = await proxyFetch(`${url}/models`, { headers: set.formatterApiKey ? { 'Authorization': `Bearer ${set.formatterApiKey.trim()}` } : {} }); m = d.data?.map(it => typeof it === 'string' ? it : it.id) || []; }
-            else { const d = await proxyFetch(`${url}/v1beta/models`, { headers: set.formatterApiKey ? { 'x-goog-api-key': set.formatterApiKey.trim() } : {} }); m = d.models?.map(it => it.name.replace('models/', '')) || []; }
-            if (m.length) { const sel = $('#m_f_model_sel').empty().show(); $('#m_f_model').hide(); m.forEach(it => sel.append(`<option value="${it}">${it}</option>`)); sel.val(m[0]); sync(); toastr.success('获取成功'); }
-        } catch(e){ toastr.error(e.message); }
-    });
-    $('#m_f_test_conn').on('click', async () => {
-        try {
-            const set = s(); let d;
-            if (set.formatterFormat === API_FORMATS.OAI) {
-                const url = normalizeOaiUrl(set.formatterApiUrl);
-                d = await proxyFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(set.formatterApiKey ? { 'Authorization': `Bearer ${set.formatterApiKey.trim()}` } : {}) }, body: { model: set.formatterModel, messages: [{ role: 'user', content: 'Say connected' }], temperature: 0.1 } });
-            } else {
-                const baseUrl = (set.formatterApiUrl || '').trim().replace(/\/+$/, '');
-                const url = `${baseUrl}/v1beta/models/${set.formatterModel}:generateContent`;
-                const headers = { 'Content-Type': 'application/json', ...(set.formatterApiKey ? { 'x-goog-api-key': set.formatterApiKey.trim() } : {}) };
-                d = await proxyFetch(url, { method: 'POST', headers, body: { contents: [{ role: 'user', parts: [{ text: 'Say connected' }] }] } });
-            }
-            if(d) toastr.success('API 连通成功！');
-        } catch(e){ toastr.error(e.message); }
-    });
-    $('#m_test_minimax').on('click', async () => {
-        try {
-            const item = { text: '你好', options: buildSynthesisOptions(null, null), serverPath: null };
-            const blob = await getAudioBlob(item);
-            new Audio(URL.createObjectURL(blob)).play();
-            toastr.success('语音连通成功！');
-        } catch(e) { toastr.error(e.message); }
-    });
-    $('#m_add_b').on('click', () => { const c = getContext(), id = c.characterId || c.character_id || c.name2 || 'global'; if (!s().characterBindingsMap[id]) s().characterBindingsMap[id] = []; s().characterBindingsMap[id].push({ targetType: 'custom', customName: '', voiceId: '', model: s().model }); renderB(); sync(); });
 
     loadSettings();
-    $('#m_key').val(s().apiKey); $('#m_gid').val(s().groupId); $('#m_apihost').val(s().apiHost || DEFAULT_API_HOST); $('#m_voice').val(s().voiceId); $('#m_model').val(s().model);
-    $('#m_speed').val(s().speed); $('#m_vol').val(s().vol); $('#m_autoplay').prop('checked', s().autoPlay); $('#m_quoteonly').prop('checked', s().quoteOnly !== false);
-    $('#m_f_en').prop('checked', s().formatterEnabled); $('#m_f_format').val(s().formatterFormat);
-    $('#m_f_url').val(s().formatterApiUrl); $('#m_f_key').val(s().formatterApiKey);
-    $('#m_f_model').val(s().formatterModel); $('#m_f_prompt').val(s().formatterSystemPrompt);
-    upPresets(); upTemplates(); renderB();
-    $('.minimax-quote-tts-panel-inner input, .minimax-quote-tts-panel-inner select, .minimax-quote-tts-panel-inner textarea').on('input change', sync);
-    eventSource.on(event_types.CHARACTER_SELECTED, renderB); eventSource.on(event_types.CHAT_CHANGED, renderB);
+    refreshAllLlmPresetSelects();
+    eventSource.on(event_types.CHARACTER_SELECTED, () => { if (document.getElementById('mm_b_rows')) renderBindings(); });
+    eventSource.on(event_types.CHAT_CHANGED, () => { if (document.getElementById('mm_b_rows')) renderBindings(); });
+}
+
+// ── 辅助函数 ────────────────────────────────────────────────────────────────────
+
+function getDefaultVcBlocks() {
+    return [
+        { id: 'charDesc',  enabled: true,  label: '角色卡描述',     editable: false, hint: '（自动读取当前角色卡描述）' },
+        { id: 'worldBook', enabled: false, label: '世界书',         editable: false, hint: '（世界书注入内容，内容多时注意 token 消耗）' },
+        { id: 'context',   enabled: true,  label: '上下文对话',     editable: false, hint: '（酒馆聊天记录，见下方条数设置）' },
+        { id: 'vcSystem',  enabled: true,  label: '通话系统提示词', editable: true  },
+    ];
+}
+
+function renderVoiceLibrary() {
+    const container = document.getElementById('mm_voice_lib_rows');
+    if (!container) return;
+    container.innerHTML = '';
+    const lib = s().voiceLibrary || [];
+    lib.forEach((v, i) => {
+        const el = document.createElement('div');
+        el.className = 'mm-voice-lib-row';
+        el.innerHTML = `
+            <input class="text_pole vl-name" placeholder="名称（如：路人甲女声）" value="${escHtml(v.name||'')}">
+            <input class="text_pole vl-id"   placeholder="voiceId" value="${escHtml(v.voiceId||'')}">
+            <button class="menu_button vl-del" style="padding:4px 10px;flex-shrink:0">×</button>
+        `;
+        el.querySelector('.vl-name').addEventListener('input', function() { lib[i].name = this.value; saveSettingsDebounced(); refreshVoiceSelects(); });
+        el.querySelector('.vl-id').addEventListener('input',   function() { lib[i].voiceId = this.value; saveSettingsDebounced(); });
+        el.querySelector('.vl-del').addEventListener('click',  () => { lib.splice(i, 1); saveSettingsDebounced(); renderVoiceLibrary(); refreshVoiceSelects(); });
+        container.appendChild(el);
+    });
+}
+
+function refreshVoiceSelects() {
+    const lib = s().voiceLibrary || [];
+    const opts = '<option value="">直接输入</option>' + lib.map(v => `<option value="${escHtml(v.voiceId)}">${escHtml(v.name)}</option>`).join('');
+    document.querySelectorAll('.mm-voice-sel').forEach(el => {
+        const cur = el.value;
+        el.innerHTML = opts;
+        if (cur && [...el.options].some(o => o.value === cur)) el.value = cur;
+    });
+}
+
+function renderRules() {
+    const container = document.getElementById('mm_rule_rows');
+    if (!container) return;
+    container.innerHTML = '';
+    const rules = s().regexRules || [];
+    rules.forEach((rule, i) => {
+        const el = document.createElement('div');
+        el.className = 'mm-rule-row';
+        el.innerHTML = `
+            <input type="checkbox" class="mm-rule-toggle" ${rule.enabled ? 'checked' : ''} title="启用/禁用">
+            <input class="text_pole mm-rule-name"    placeholder="规则名" value="${escHtml(rule.name||'')}">
+            <input class="text_pole mm-rule-pattern" placeholder="正则表达式" value="${escHtml(rule.pattern||'')}">
+            <select class="text_pole mm-rule-mode" style="max-width:68px">
+                <option value="extract" ${rule.mode==='extract'?'selected':''}>提取</option>
+                <option value="exclude" ${rule.mode==='exclude'?'selected':''}>排除</option>
+            </select>
+            <button class="menu_button mm-rule-del" title="删除" style="padding:4px 10px;flex-shrink:0">×</button>
+        `;
+        el.querySelector('.mm-rule-toggle').addEventListener('change', function() { rules[i].enabled = this.checked; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-name').addEventListener('input',    function() { rules[i].name = this.value; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-pattern').addEventListener('input', function() { rules[i].pattern = this.value; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-mode').addEventListener('change',   function() { rules[i].mode = this.value; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-del').addEventListener('click',     () => { rules.splice(i, 1); saveSettingsDebounced(); renderRules(); });
+        container.appendChild(el);
+    });
+}
+
+function renderVcBlocks() {
+    if (!s().vcPromptBlocks) s().vcPromptBlocks = getDefaultVcBlocks();
+    const blocks = s().vcPromptBlocks;
+    const container = document.getElementById('mm_vc_blocks');
+    if (!container) return;
+    container.innerHTML = '';
+    const BUILTIN_IDS = new Set(['charDesc', 'worldBook', 'context', 'vcSystem']);
+    blocks.forEach((block, i) => {
+        const el = document.createElement('div');
+        el.className = 'mm-block mm-draggable';
+        el.draggable = true;
+        el.dataset.idx = i;
+        const isBuiltin = BUILTIN_IDS.has(block.id);
+        // For vcSystem block, use s().vcSystemPrompt; for custom blocks, use block.content
+        const textareaVal = block.id === 'vcSystem' ? escHtml(s().vcSystemPrompt||'') : escHtml(block.content||'');
+        el.innerHTML = `
+            <div class="mm-block-header">
+                <span class="mm-drag-handle" title="拖拽排序">≡</span>
+                <input type="checkbox" class="mm-block-toggle" ${block.enabled ? 'checked' : ''}>
+                <span class="mm-block-label">${escHtml(block.label)}</span>
+                <div style="display:flex;gap:4px;margin-left:auto">
+                    ${block.editable ? `<button class="mm-rename-block menu_button" title="重命名" style="padding:2px 8px;font-size:0.78rem">✎</button>` : ''}
+                    ${block.editable ? `<button class="mm-expand-block menu_button" title="展开编辑" style="padding:2px 8px;font-size:0.78rem">⛶</button>` : ''}
+                    ${!isBuiltin ? `<button class="mm-del-block menu_button" title="删除" style="padding:2px 8px;font-size:0.78rem">×</button>` : ''}
+                </div>
+            </div>
+            ${block.hint ? `<div class="mm-block-hint">${block.hint}</div>` : ''}
+            ${block.editable ? `<div class="mm-block-content"><textarea class="mm-block-textarea text_pole" style="min-height:64px;margin-top:6px;width:100%">${textareaVal}</textarea></div>` : ''}
+        `;
+        el.querySelector('.mm-block-toggle').addEventListener('change', function() {
+            s().vcPromptBlocks[i].enabled = this.checked; saveSettingsDebounced();
+        });
+        if (block.editable) {
+            el.querySelector('.mm-block-textarea').addEventListener('input', function() {
+                if (block.id === 'vcSystem') s().vcSystemPrompt = this.value;
+                else s().vcPromptBlocks[i].content = this.value;
+                saveSettingsDebounced();
+            });
+        }
+        el.querySelector('.mm-del-block')?.addEventListener('click', () => {
+            s().vcPromptBlocks.splice(i, 1); saveSettingsDebounced(); renderVcBlocks();
+        });
+        el.querySelector('.mm-rename-block')?.addEventListener('click', () => {
+            const name = prompt('重命名块：', block.label);
+            if (name !== null && name.trim()) {
+                s().vcPromptBlocks[i].label = name.trim();
+                saveSettingsDebounced(); renderVcBlocks();
+            }
+        });
+        el.querySelector('.mm-expand-block')?.addEventListener('click', async () => {
+            const ta = document.createElement('textarea');
+            ta.className = 'text_pole';
+            ta.style.cssText = 'width:100%;height:45vh;resize:none;font-family:inherit;box-sizing:border-box';
+            ta.value = block.id === 'vcSystem' ? (s().vcSystemPrompt || '') : (block.content || '');
+            const ok = await callGenericPopup(ta, POPUP_TYPE.CONFIRM, '', { wide: true, okButton: '确认', cancelButton: '取消' });
+            if (ok) {
+                if (block.id === 'vcSystem') s().vcSystemPrompt = ta.value;
+                else s().vcPromptBlocks[i].content = ta.value;
+                saveSettingsDebounced(); renderVcBlocks();
+            }
+        });
+        // Drag-and-drop
+        el.addEventListener('dragstart', e => {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', String(i));
+            el.classList.add('mm-dragging');
+        });
+        el.addEventListener('dragend',  () => el.classList.remove('mm-dragging'));
+        el.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; el.classList.add('mm-drag-over'); });
+        el.addEventListener('dragleave',() => el.classList.remove('mm-drag-over'));
+        el.addEventListener('drop',     e => {
+            e.preventDefault(); el.classList.remove('mm-drag-over');
+            const fromIdx = Number(e.dataTransfer.getData('text/plain')), toIdx = i;
+            if (fromIdx === toIdx) return;
+            const arr = s().vcPromptBlocks;
+            const [moved] = arr.splice(fromIdx, 1);
+            arr.splice(toIdx, 0, moved);
+            saveSettingsDebounced(); renderVcBlocks();
+        });
+        container.appendChild(el);
+    });
+}
+
+function renderBindings() {
+    const c = getContext(), id = c.characterId || c.character_id || c.name2 || 'global';
+    if (!s().characterBindingsMap[id]) s().characterBindingsMap[id] = [];
+    const container = $('#mm_b_rows');
+    if (!container.length) return;
+    container.empty();
+    const lib = s().voiceLibrary || [];
+    s().characterBindingsMap[id].forEach((b, i) => {
+        const voiceOpts = '<option value="">直接输入</option>' + lib.map(v => `<option value="${escHtml(v.voiceId)}">${escHtml(v.name)}</option>`).join('');
+        const libMatch = lib.find(v => v.voiceId === b.voiceId);
+        const row = $(`<div class="mm-binding-row">
+            <select class="text_pole b-type">
+                <option value="${TARGET_TYPE.CURRENT_CHARACTER}">${escHtml(c.name2||'角色')}</option>
+                <option value="${TARGET_TYPE.CURRENT_USER}">${escHtml(c.name1||'你')}</option>
+                <option value="${TARGET_TYPE.CUSTOM}">自定义</option>
+            </select>
+            <input class="text_pole b-name" placeholder="名称" value="${escHtml(b.customName||'')}" style="${b.targetType===TARGET_TYPE.CUSTOM?'':'display:none'}">
+            <select class="text_pole b-model">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select>
+            <select class="text_pole b-voice-lib mm-voice-sel">${voiceOpts}</select>
+            <input class="text_pole b-voice" placeholder="voiceId" value="${escHtml(libMatch?'':b.voiceId||'')}" style="${libMatch?'display:none':''}">
+            <button class="menu_button b-del" style="padding:4px 10px;flex-shrink:0">×</button>
+        </div>`);
+        row.find('.b-type').val(b.targetType).on('change', function() { b.targetType=$(this).val(); renderBindings(); saveSettingsDebounced(); });
+        row.find('.b-name').on('input', function() { b.customName=$(this).val(); saveSettingsDebounced(); });
+        row.find('.b-model').val(b.model || s().model).on('change', function() { b.model=$(this).val(); saveSettingsDebounced(); });
+        row.find('.b-voice-lib').val(libMatch ? b.voiceId : '').on('change', function() {
+            const v = $(this).val(); b.voiceId = v;
+            row.find('.b-voice').toggle(!v).val(''); saveSettingsDebounced();
+        });
+        row.find('.b-voice').on('input', function() { b.voiceId=$(this).val(); saveSettingsDebounced(); });
+        row.find('.b-del').on('click', () => { s().characterBindingsMap[id].splice(i, 1); renderBindings(); saveSettingsDebounced(); });
+        container.append(row);
+    });
+}
+
+function renderRegexPresets() {
+    const sel = document.getElementById('mm_regex_presets');
+    if (!sel) return;
+    sel.innerHTML = '<option value="-1">-- 选择预设 --</option>';
+    (s().regexPresets || []).forEach((p, i) => {
+        const opt = document.createElement('option');
+        opt.value = i; opt.textContent = p.name;
+        sel.appendChild(opt);
+    });
+}
+
+function openConfigPanel() {
+    if (!document.getElementById('mm-config-mask')) {
+        const panelHtml = `
+<div id="mm-config-mask" class="mm-config-mask">
+  <div id="mm-config-dialog" class="mm-config-dialog">
+    <div class="mm-config-header">
+      <div class="mm-tab-bar" role="tablist">
+        <button class="mm-tab active" data-tab="tts">TTS配置</button>
+        <button class="mm-tab" data-tab="llm">LLM预设</button>
+        <button class="mm-tab" data-tab="format">格式化</button>
+        <button class="mm-tab" data-tab="vc">语音通话</button>
+      </div>
+      <button class="mm-config-close" title="关闭">✕</button>
+    </div>
+    <div class="mm-config-body">
+
+      <!-- Tab: TTS配置 -->
+      <div class="mm-tab-panel active" data-panel="tts">
+        <p class="mm-desc">配置 MiniMax TTS API 连接参数及默认音色。</p>
+        <div class="mm-row"><label>API Key</label><input id="mm_key" class="text_pole" type="password" autocomplete="off"></div>
+        <div class="mm-row"><label>Group ID</label><input id="mm_gid" class="text_pole" type="text"></div>
+        <div class="mm-row"><label>API 节点</label><select id="mm_apihost" class="text_pole">${API_HOST_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
+        <div class="mm-row"><label>默认模型</label><select id="mm_model" class="text_pole">${MODEL_OPTIONS.map(o=>`<option value="${o.value}">${o.label}</option>`).join('')}</select></div>
+        <div class="mm-row">
+          <label>默认语音</label>
+          <select id="mm_voice_sel" class="text_pole mm-voice-sel" style="flex:1"></select>
+          <input id="mm_voice" class="text_pole" placeholder="voiceId" style="max-width:160px">
+        </div>
+        <div class="mm-row"><label>语速</label><input id="mm_speed" class="text_pole" type="number" step="0.1" min="0.5" max="2" style="max-width:80px"></div>
+        <div class="mm-row"><label>音量</label><input id="mm_vol" class="text_pole" type="number" step="0.1" min="0" max="10" style="max-width:80px"></div>
+        <div class="mm-row"><label>自动播放</label><input id="mm_autoplay" type="checkbox"></div>
+        <div class="mm-row"><button id="mm_test_tts" class="menu_button"><i class="fa-solid fa-play"></i> 测试语音</button></div>
+        <div class="mm-section-title">语音库 <button id="mm_add_voice" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+ 添加</button></div>
+        <p class="mm-desc">为语音 ID 起名，便于在角色绑定中按名选择。</p>
+        <div id="mm_voice_lib_rows" class="mm-voice-lib-list"></div>
+        <div class="mm-section-title" style="margin-top:16px">角色绑定 <button id="mm_add_b" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+ 添加</button></div>
+        <p class="mm-desc">为当前角色卡的各角色分配专属音色，优先级高于默认语音。</p>
+        <div id="mm_b_rows"></div>
+      </div>
+
+      <!-- Tab: LLM预设 -->
+      <div class="mm-tab-panel" data-panel="llm">
+        <p class="mm-desc">管理用于格式化和语音通话的 LLM API 预设。</p>
+        <div class="mm-row">
+          <label>预设</label>
+          <select id="mm_llm_presets" class="text_pole llm-preset-sel"></select>
+          <button id="mm_llm_save_p" class="menu_button">保存</button>
+          <button id="mm_llm_upd_p" class="menu_button">更新</button>
+          <button id="mm_llm_del_p" class="menu_button">删除</button>
+        </div>
+        <div class="mm-row"><label>接口格式</label><select id="mm_llm_format" class="text_pole"><option value="${API_FORMATS.OAI}">OpenAI</option><option value="${API_FORMATS.GOOGLE}">Google Gemini</option></select></div>
+        <div class="mm-row"><label>API 地址</label><input id="mm_llm_url" class="text_pole" type="text" placeholder="https://api.openai.com/v1"></div>
+        <div class="mm-row"><label>API 密钥</label><input id="mm_llm_key" class="text_pole" type="password" autocomplete="off"></div>
+        <div class="mm-row"><label>AI 模型</label><input id="mm_llm_model" class="text_pole" type="text"><select id="mm_llm_model_sel" class="text_pole" style="display:none"></select><button id="mm_llm_fetch" class="menu_button">获取</button><button id="mm_llm_test_conn" class="menu_button">测试</button></div>
+      </div>
+
+      <!-- Tab: 格式化（正则规则 + 副LLM） -->
+      <div class="mm-tab-panel" data-panel="format">
+        <p class="mm-desc">两种格式化方式：正则规则手动提取朗读内容；启用副 LLM 后交由 AI 结构化处理（支持多角色/情感），两者互斥，启用副 LLM 时正则规则不生效。</p>
+
+        <div class="mm-section-title">正则文本规则 <button id="mm_add_rule" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+ 添加</button></div>
+        <div class="mm-rule-header-row">
+          <span style="flex:0 0 20px"></span>
+          <span style="flex:1.2">名称</span>
+          <span style="flex:2">正则表达式</span>
+          <span style="flex:0 0 68px">模式</span>
+          <span style="flex:0 0 36px"></span>
+        </div>
+        <div id="mm_rule_rows"></div>
+        <div class="mm-section-title" style="margin-top:12px">规则预设</div>
+        <div class="mm-row" style="flex-wrap:wrap;gap:6px">
+          <select id="mm_regex_presets" class="text_pole" style="min-width:120px;flex:1"></select>
+          <button id="mm_regex_save_p" class="menu_button">保存</button>
+          <button id="mm_regex_upd_p" class="menu_button">更新</button>
+          <button id="mm_regex_del_p" class="menu_button">删除</button>
+          <button id="mm_regex_export" class="menu_button">导出</button>
+          <button id="mm_regex_import" class="menu_button">导入</button>
+        </div>
+
+        <div class="mm-section-title" style="margin-top:16px">副 LLM 格式化</div>
+        <div class="mm-row"><label>启用格式化</label><input id="mm_f_en" type="checkbox"></div>
+        <div class="mm-row"><label>LLM预设</label><select id="mm_f_preset_sel" class="text_pole llm-preset-sel"></select></div>
+        <div class="mm-row" style="flex-wrap:wrap;gap:6px">
+          <label style="min-width:85px">模板</label>
+          <select id="mm_f_templates" class="text_pole" style="min-width:120px;flex:1"></select>
+          <button id="mm_f_save_t" class="menu_button">保存</button>
+          <button id="mm_f_upd_t" class="menu_button">更新</button>
+          <button id="mm_f_del_t" class="menu_button">删除</button>
+          <button id="mm_f_export_t" class="menu_button">导出</button>
+          <button id="mm_f_import_t" class="menu_button">导入</button>
+        </div>
+        <div class="mm-row" style="align-items:flex-start">
+          <label style="padding-top:6px">系统提示词</label>
+          <textarea id="mm_f_prompt" class="text_pole" style="flex:1;width:0"></textarea>
+        </div>
+      </div>
+
+      <!-- Tab: 语音通话 -->
+      <div class="mm-tab-panel" data-panel="vc">
+        <p class="mm-desc">实时语音通话。启用后悬浮球出现，点击发起通话。推荐使用无思考链的极速模型以降低延迟。</p>
+        <div class="mm-row"><label>启用通话</label><input id="mm_vc_enabled" type="checkbox"></div>
+        <div class="mm-row"><label>LLM 预设</label><select id="mm_vc_llm_preset" class="text_pole llm-preset-sel"></select></div>
+        <div class="mm-row">
+          <label>挂断注入</label>
+          <input id="mm_vc_inject" type="checkbox">
+          <span class="mm-inline-hint">通话结束后把记录注入聊天</span>
+        </div>
+        <div class="mm-section-title" style="margin-top:16px">通话提示词</div>
+        <div class="mm-row" style="flex-wrap:wrap;gap:6px">
+          <select id="mm_vc_templates" class="text_pole" style="min-width:120px;flex:1"></select>
+          <button id="mm_vc_save_t" class="menu_button">保存</button>
+          <button id="mm_vc_upd_t" class="menu_button">更新</button>
+          <button id="mm_vc_del_t" class="menu_button">删除</button>
+          <button id="mm_vc_export_t" class="menu_button">导出</button>
+          <button id="mm_vc_import_t" class="menu_button">导入</button>
+        </div>
+        <p class="mm-hint">拖拽 ≡ 可调整顺序，☑ 开关模块。上下文越多注入演绎更准确但回复更慢，反之亦然。</p>
+        <div id="mm_vc_blocks" class="mm-block-list"></div>
+        <div class="mm-row" style="margin-top:12px">
+          <label>上下文条数</label>
+          <input id="mm_vc_ctx_count" class="text_pole" type="number" style="max-width:70px">
+          <span class="mm-inline-hint">条（注入通话前）</span>
+        </div>
+        <div class="mm-row" style="margin-top:6px">
+          <button id="mm_vc_add_block" class="menu_button"><i class="fa-solid fa-plus"></i> 添加自定义块</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>`;
+        document.documentElement.insertAdjacentHTML('beforeend', panelHtml);
+
+        // ── Tab 切换 ──
+        document.querySelectorAll('#mm-config-dialog .mm-tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                const t = this.dataset.tab;
+                document.querySelectorAll('#mm-config-dialog .mm-tab').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                document.querySelectorAll('#mm-config-dialog .mm-tab-panel').forEach(p => p.classList.remove('active'));
+                document.querySelector(`#mm-config-dialog .mm-tab-panel[data-panel="${t}"]`).classList.add('active');
+                if (t === 'vc')     { renderVcBlocks(); }
+                if (t === 'tts')    { renderVoiceLibrary(); refreshVoiceSelects(); renderBindings(); }
+                if (t === 'format') { renderRules(); renderRegexPresets(); }
+            });
+        });
+
+        // ── 关闭 ──
+        document.getElementById('mm-config-mask').addEventListener('click', function(e) {
+            if (e.target === this) this.classList.remove('mm-config-open');
+        });
+        document.querySelector('#mm-config-dialog .mm-config-close').addEventListener('click', () => {
+            document.getElementById('mm-config-mask').classList.remove('mm-config-open');
+        });
+
+        // ── TTS 基础 ──
+        const syncTts = () => {
+            const voiceSel = document.getElementById('mm_voice_sel');
+            s().apiKey  = document.getElementById('mm_key').value;
+            s().groupId = document.getElementById('mm_gid').value;
+            s().apiHost = document.getElementById('mm_apihost').value;
+            s().model   = document.getElementById('mm_model').value;
+            s().voiceId = voiceSel.value || document.getElementById('mm_voice').value;
+            s().speed   = Number(document.getElementById('mm_speed').value);
+            s().vol     = Number(document.getElementById('mm_vol').value);
+            s().autoPlay = document.getElementById('mm_autoplay').checked;
+            saveSettingsDebounced();
+        };
+        ['mm_key','mm_gid','mm_apihost','mm_model','mm_voice_sel','mm_voice','mm_speed','mm_vol','mm_autoplay'].forEach(id => {
+            const el = document.getElementById(id);
+            el.addEventListener('input', syncTts);
+            el.addEventListener('change', syncTts);
+        });
+        document.getElementById('mm_voice_sel').addEventListener('change', function() {
+            document.getElementById('mm_voice').style.display = this.value ? 'none' : '';
+        });
+        document.getElementById('mm_test_tts').addEventListener('click', async () => {
+            try {
+                const item = { text: '你好，我是MiniMax语音。', options: buildSynthesisOptions(null, null), serverPath: null };
+                const blob = await getAudioBlob(item);
+                new Audio(URL.createObjectURL(blob)).play();
+                toastr.success('语音连通成功！');
+            } catch(e) { toastr.error(e.message); }
+        });
+        document.getElementById('mm_add_voice').addEventListener('click', () => {
+            if (!s().voiceLibrary) s().voiceLibrary = [];
+            s().voiceLibrary.push({ name: '', voiceId: '' });
+            renderVoiceLibrary(); saveSettingsDebounced();
+        });
+
+        // ── 角色绑定 ──
+        document.getElementById('mm_add_b').addEventListener('click', () => {
+            const c = getContext(), id = c.characterId || c.character_id || c.name2 || 'global';
+            if (!s().characterBindingsMap[id]) s().characterBindingsMap[id] = [];
+            s().characterBindingsMap[id].push({ targetType: TARGET_TYPE.CUSTOM, customName: '', voiceId: '', model: s().model });
+            renderBindings(); saveSettingsDebounced();
+        });
+
+        // ── 文本规则 ──
+        document.getElementById('mm_add_rule').addEventListener('click', () => {
+            if (!s().regexRules) s().regexRules = [];
+            s().regexRules.push({ id: 'rule-' + Date.now(), enabled: true, name: '新规则', pattern: '', flags: 'g', mode: 'extract' });
+            renderRules(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_regex_save_p').addEventListener('click', () => {
+            const name = prompt('预设名称：'); if (!name) return;
+            if (!s().regexPresets) s().regexPresets = [];
+            s().regexPresets.push({ name, rules: JSON.parse(JSON.stringify(s().regexRules || [])) });
+            renderRegexPresets(); saveSettingsDebounced(); toastr.success('预设已保存');
+        });
+        document.getElementById('mm_regex_upd_p').addEventListener('click', () => {
+            const i = Number(document.getElementById('mm_regex_presets').value);
+            if (i < 0 || !s().regexPresets?.[i]) return;
+            s().regexPresets[i].rules = JSON.parse(JSON.stringify(s().regexRules || []));
+            saveSettingsDebounced(); toastr.success('预设已更新');
+        });
+        document.getElementById('mm_regex_presets').addEventListener('change', function() {
+            const i = Number(this.value);
+            if (i < 0 || !s().regexPresets?.[i]) return;
+            s().regexRules = JSON.parse(JSON.stringify(s().regexPresets[i].rules));
+            renderRules(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_regex_del_p').addEventListener('click', () => {
+            const i = Number(document.getElementById('mm_regex_presets').value);
+            if (i < 0 || !s().regexPresets?.[i]) return;
+            s().regexPresets.splice(i, 1); renderRegexPresets(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_regex_export').addEventListener('click', () => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([JSON.stringify(s().regexPresets || [], null, 2)], {type:'application/json'}));
+            a.download = 'regex_presets.json'; a.click();
+        });
+        document.getElementById('mm_regex_import').addEventListener('click', () => {
+            const inp = document.createElement('input');
+            inp.type = 'file'; inp.accept = '.json';
+            inp.onchange = async () => {
+                try {
+                    const data = JSON.parse(await inp.files[0].text());
+                    if (Array.isArray(data)) {
+                        if (!s().regexPresets) s().regexPresets = [];
+                        s().regexPresets.push(...data);
+                        renderRegexPresets(); saveSettingsDebounced();
+                        toastr.success(`已导入 ${data.length} 个预设`);
+                    }
+                } catch(e) { toastr.error('导入失败: ' + e.message); }
+            };
+            inp.click();
+        });
+
+        // ── 副LLM格式化 ──
+        const syncFormatter = () => {
+            s().formatterEnabled   = document.getElementById('mm_f_en').checked;
+            s().formatterPresetIdx = Number(document.getElementById('mm_f_preset_sel').value);
+            s().formatterSystemPrompt = document.getElementById('mm_f_prompt').value;
+            saveSettingsDebounced();
+        };
+        const selFT = document.getElementById('mm_f_templates');
+        const upFTemplates = () => {
+            selFT.innerHTML = '<option value="-1">-- 新建模板 --</option>';
+            (s().formatterTemplates || []).forEach((t, i) => {
+                const o = document.createElement('option'); o.value = i; o.textContent = t.name; selFT.appendChild(o);
+            });
+        };
+        ['mm_f_en','mm_f_preset_sel','mm_f_prompt'].forEach(id => {
+            document.getElementById(id).addEventListener('input', syncFormatter);
+            document.getElementById(id).addEventListener('change', syncFormatter);
+        });
+        selFT.addEventListener('change', function() {
+            const t = (s().formatterTemplates||[])[Number(this.value)];
+            if (t) { document.getElementById('mm_f_prompt').value = t.content; syncFormatter(); }
+        });
+        document.getElementById('mm_f_save_t').addEventListener('click', () => {
+            const n = prompt('模板名:'); if (!n) return;
+            if (!s().formatterTemplates) s().formatterTemplates = [];
+            s().formatterTemplates.push({ name: n, content: document.getElementById('mm_f_prompt').value });
+            upFTemplates(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_f_upd_t').addEventListener('click', () => {
+            const i = Number(selFT.value); if (i >= 0) { (s().formatterTemplates||[])[i].content = document.getElementById('mm_f_prompt').value; toastr.success('更新成功'); saveSettingsDebounced(); }
+        });
+        document.getElementById('mm_f_del_t').addEventListener('click', () => {
+            const i = Number(selFT.value); if (i >= 0) { (s().formatterTemplates||[]).splice(i, 1); upFTemplates(); saveSettingsDebounced(); }
+        });
+        document.getElementById('mm_f_export_t').addEventListener('click', () => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([JSON.stringify(s().formatterTemplates || [], null, 2)], {type:'application/json'}));
+            a.download = 'formatter_templates.json'; a.click();
+        });
+        document.getElementById('mm_f_import_t').addEventListener('click', () => {
+            const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json';
+            inp.onchange = async () => {
+                try {
+                    const data = JSON.parse(await inp.files[0].text());
+                    if (Array.isArray(data)) { if (!s().formatterTemplates) s().formatterTemplates = []; s().formatterTemplates.push(...data); upFTemplates(); saveSettingsDebounced(); toastr.success(`已导入 ${data.length} 个模板`); }
+                } catch(e) { toastr.error('导入失败: ' + e.message); }
+            };
+            inp.click();
+        });
+        // ── LLM 预设 CRUD ──
+        const loadLlmPresetFields = (i) => {
+            const p = (s().llmPresets || [])[i]; if (!p) return;
+            document.getElementById('mm_llm_url').value    = p.url    || '';
+            document.getElementById('mm_llm_key').value    = p.key    || '';
+            document.getElementById('mm_llm_format').value = p.format || API_FORMATS.OAI;
+            document.getElementById('mm_llm_model').value  = p.model  || '';
+            document.getElementById('mm_llm_model').style.display     = '';
+            document.getElementById('mm_llm_model_sel').style.display = 'none';
+        };
+        document.getElementById('mm_llm_presets').addEventListener('change', function() { loadLlmPresetFields(Number(this.value)); });
+        document.getElementById('mm_llm_save_p').addEventListener('click', () => {
+            const n = prompt('预设名:'); if (!n) return;
+            const modelSel = document.getElementById('mm_llm_model_sel');
+            const model = modelSel.style.display !== 'none' ? modelSel.value : document.getElementById('mm_llm_model').value;
+            s().llmPresets.push({ name: n, url: document.getElementById('mm_llm_url').value, key: document.getElementById('mm_llm_key').value, format: document.getElementById('mm_llm_format').value, model });
+            const newIdx = s().llmPresets.length - 1;
+            refreshAllLlmPresetSelects(); document.getElementById('mm_llm_presets').value = newIdx;
+            saveSettingsDebounced(); toastr.success('预设已保存');
+        });
+        document.getElementById('mm_llm_upd_p').addEventListener('click', () => {
+            const i = Number(document.getElementById('mm_llm_presets').value);
+            if (i < 0 || i >= s().llmPresets.length) return;
+            const modelSel = document.getElementById('mm_llm_model_sel');
+            const model = modelSel.style.display !== 'none' ? modelSel.value : document.getElementById('mm_llm_model').value;
+            s().llmPresets[i] = { ...s().llmPresets[i], url: document.getElementById('mm_llm_url').value, key: document.getElementById('mm_llm_key').value, format: document.getElementById('mm_llm_format').value, model };
+            refreshAllLlmPresetSelects(); document.getElementById('mm_llm_presets').value = i;
+            saveSettingsDebounced(); toastr.success('预设已更新');
+        });
+        document.getElementById('mm_llm_del_p').addEventListener('click', () => {
+            const i = Number(document.getElementById('mm_llm_presets').value);
+            if (i < 0 || i >= s().llmPresets.length) return;
+            s().llmPresets.splice(i, 1);
+            if (s().formatterPresetIdx >= s().llmPresets.length) s().formatterPresetIdx = s().llmPresets.length - 1;
+            if (s().vcLlmPresetIdx >= s().llmPresets.length) s().vcLlmPresetIdx = s().llmPresets.length - 1;
+            refreshAllLlmPresetSelects();
+            const newI = Number(document.getElementById('mm_llm_presets').value);
+            if (newI >= 0) loadLlmPresetFields(newI);
+            else {
+                ['mm_llm_url','mm_llm_key','mm_llm_model'].forEach(id => document.getElementById(id).value = '');
+                document.getElementById('mm_llm_format').value = API_FORMATS.OAI;
+                document.getElementById('mm_llm_model').style.display     = '';
+                document.getElementById('mm_llm_model_sel').style.display = 'none';
+            }
+            saveSettingsDebounced();
+        });
+        document.getElementById('mm_llm_fetch').addEventListener('click', async () => {
+            const url    = document.getElementById('mm_llm_url').value.trim().replace(/\/chat\/completions$/, '').replace(/\/+$/, '');
+            const key    = document.getElementById('mm_llm_key').value.trim();
+            const format = document.getElementById('mm_llm_format').value;
+            try {
+                let m = [];
+                if (format === API_FORMATS.OAI) { const d = await proxyFetch(`${url}/models`, { headers: key ? { 'Authorization': `Bearer ${key}` } : {} }); m = d.data?.map(it => typeof it === 'string' ? it : it.id) || []; }
+                else { const d = await proxyFetch(`${url}/v1beta/models`, { headers: key ? { 'x-goog-api-key': key } : {} }); m = d.models?.map(it => it.name.replace('models/', '')) || []; }
+                if (m.length) {
+                    const sel = document.getElementById('mm_llm_model_sel');
+                    sel.innerHTML = ''; sel.style.display = '';
+                    document.getElementById('mm_llm_model').style.display = 'none';
+                    m.forEach(it => { const o = document.createElement('option'); o.value = it; o.textContent = it; sel.appendChild(o); });
+                    sel.value = m[0]; toastr.success('获取成功');
+                }
+            } catch(e) { toastr.error(e.message); }
+        });
+        document.getElementById('mm_llm_test_conn').addEventListener('click', async () => {
+            const url    = document.getElementById('mm_llm_url').value.trim();
+            const key    = document.getElementById('mm_llm_key').value.trim();
+            const format = document.getElementById('mm_llm_format').value;
+            const modelSel = document.getElementById('mm_llm_model_sel');
+            const model = modelSel.style.display !== 'none' ? modelSel.value : document.getElementById('mm_llm_model').value;
+            try {
+                let d;
+                if (format === API_FORMATS.OAI) {
+                    d = await proxyFetch(normalizeOaiUrl(url), { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Authorization': `Bearer ${key}` } : {}) }, body: { model, messages: [{ role: 'user', content: 'Say connected' }], temperature: 0.1 } });
+                } else {
+                    const gUrl = `${url.replace(/\/+$/, '')}/v1beta/models/${model}:generateContent`;
+                    d = await proxyFetch(gUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'x-goog-api-key': key } : {}) }, body: { contents: [{ role: 'user', parts: [{ text: 'Say connected' }] }] } });
+                }
+                if (d) toastr.success('API 连通成功！');
+            } catch(e) { toastr.error(e.message); }
+        });
+
+        // ── 语音通话 ──
+        const syncVc = () => {
+            const enabled = document.getElementById('mm_vc_enabled').checked;
+            s().vcEnabled      = enabled;
+            s().vcLlmPresetIdx = Number(document.getElementById('mm_vc_llm_preset').value);
+            s().vcInjectOnEnd  = document.getElementById('mm_vc_inject').checked;
+            saveSettingsDebounced();
+            // 控制悬浮球显示/隐藏
+            const fab = document.getElementById('vc-fab');
+            if (fab) fab.style.display = enabled ? '' : 'none';
+        };
+        ['mm_vc_enabled','mm_vc_llm_preset','mm_vc_inject'].forEach(id => {
+            const el = document.getElementById(id);
+            el.addEventListener('input', syncVc);
+            el.addEventListener('change', syncVc);
+        });
+
+        // VC 提示词模板
+        const vcTplSel = document.getElementById('mm_vc_templates');
+        const upVcTemplates = () => {
+            vcTplSel.innerHTML = '<option value="-1">-- 新建模板 --</option>';
+            (s().vcPromptTemplates || []).forEach((t, i) => {
+                const o = document.createElement('option'); o.value = i; o.textContent = t.name; vcTplSel.appendChild(o);
+            });
+        };
+        vcTplSel.addEventListener('change', function() {
+            const t = (s().vcPromptTemplates||[])[Number(this.value)];
+            if (t) { s().vcPromptBlocks = JSON.parse(JSON.stringify(t.blocks)); if (t.systemPrompt !== undefined) s().vcSystemPrompt = t.systemPrompt; renderVcBlocks(); saveSettingsDebounced(); }
+        });
+        document.getElementById('mm_vc_save_t').addEventListener('click', () => {
+            const n = prompt('模板名:'); if (!n) return;
+            if (!s().vcPromptTemplates) s().vcPromptTemplates = [];
+            s().vcPromptTemplates.push({ name: n, blocks: JSON.parse(JSON.stringify(s().vcPromptBlocks||getDefaultVcBlocks())), systemPrompt: s().vcSystemPrompt||'' });
+            upVcTemplates(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_vc_upd_t').addEventListener('click', () => {
+            const i = Number(vcTplSel.value); if (i >= 0) { const tpls = s().vcPromptTemplates||[]; tpls[i].blocks = JSON.parse(JSON.stringify(s().vcPromptBlocks||getDefaultVcBlocks())); tpls[i].systemPrompt = s().vcSystemPrompt||''; toastr.success('更新成功'); saveSettingsDebounced(); }
+        });
+        document.getElementById('mm_vc_del_t').addEventListener('click', () => {
+            const i = Number(vcTplSel.value); if (i >= 0) { (s().vcPromptTemplates||[]).splice(i, 1); upVcTemplates(); saveSettingsDebounced(); }
+        });
+        document.getElementById('mm_vc_export_t').addEventListener('click', () => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([JSON.stringify(s().vcPromptTemplates || [], null, 2)], {type:'application/json'}));
+            a.download = 'vc_prompt_templates.json'; a.click();
+        });
+        document.getElementById('mm_vc_import_t').addEventListener('click', () => {
+            const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json';
+            inp.onchange = async () => {
+                try {
+                    const data = JSON.parse(await inp.files[0].text());
+                    if (Array.isArray(data)) { if (!s().vcPromptTemplates) s().vcPromptTemplates = []; s().vcPromptTemplates.push(...data); upVcTemplates(); saveSettingsDebounced(); toastr.success(`已导入 ${data.length} 个模板`); }
+                } catch(e) { toastr.error('导入失败: ' + e.message); }
+            };
+            inp.click();
+        });
+        document.getElementById('mm_vc_ctx_count').addEventListener('input', function() {
+            s().vcContextCount = Number(this.value) || 10; saveSettingsDebounced();
+        });
+        document.getElementById('mm_vc_add_block').addEventListener('click', () => {
+            if (!s().vcPromptBlocks) s().vcPromptBlocks = getDefaultVcBlocks();
+            s().vcPromptBlocks.push({ id: 'custom-' + Date.now(), enabled: true, label: '自定义块', editable: true, content: '', hint: '' });
+            saveSettingsDebounced(); renderVcBlocks();
+        });
+
+        // ── Populate all fields ──
+        const set = s();
+        document.getElementById('mm_key').value     = set.apiKey  || '';
+        document.getElementById('mm_gid').value     = set.groupId || '';
+        document.getElementById('mm_apihost').value = set.apiHost || DEFAULT_API_HOST;
+        document.getElementById('mm_model').value   = set.model   || 'speech-02-hd';
+        document.getElementById('mm_speed').value   = set.speed   ?? 1;
+        document.getElementById('mm_vol').value     = set.vol     ?? 1;
+        document.getElementById('mm_autoplay').checked = set.autoPlay !== false;
+
+        // Voice selector
+        renderVoiceLibrary(); refreshVoiceSelects();
+        const voiceSel   = document.getElementById('mm_voice_sel');
+        const voiceInput = document.getElementById('mm_voice');
+        const libMatch   = (set.voiceLibrary||[]).find(v => v.voiceId === set.voiceId);
+        if (libMatch) { voiceSel.value = set.voiceId; voiceInput.style.display = 'none'; }
+        else { voiceSel.value = ''; voiceInput.value = set.voiceId || ''; }
+
+        document.getElementById('mm_f_en').checked       = set.formatterEnabled || false;
+        document.getElementById('mm_f_prompt').value     = set.formatterSystemPrompt || '';
+        upFTemplates();
+        if (set.formatterPresetIdx >= 0) document.getElementById('mm_f_preset_sel').value = set.formatterPresetIdx;
+
+        refreshAllLlmPresetSelects();
+        if ((s().llmPresets || []).length > 0) { document.getElementById('mm_llm_presets').value = 0; loadLlmPresetFields(0); }
+
+        document.getElementById('mm_vc_enabled').checked = set.vcEnabled !== false;
+        document.getElementById('mm_vc_inject').checked  = set.vcInjectOnEnd !== false;
+        if (set.vcLlmPresetIdx >= 0) document.getElementById('mm_vc_llm_preset').value = set.vcLlmPresetIdx;
+        document.getElementById('mm_vc_ctx_count').value = set.vcContextCount || 10;
+        upVcTemplates();
+
+        renderRules(); renderRegexPresets();
+        renderVcBlocks(); renderBindings();
+    }
+    document.getElementById('mm-config-mask').classList.add('mm-config-open');
 }
 
 jQuery(async () => {
@@ -407,8 +1066,9 @@ jQuery(async () => {
     
     // --- 自动播放监听 ---
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (id) => {
+        const ctx = getContext();
+        if (ctx.chat?.[id]?.extra?.voice_call) return; // 跳过通话记录注入的消息
         if (s().enabled && s().autoPlay && !vcActive) {
-            console.log('[MiniMax语音] 检测到新消息，准备自动播放:', id);
             if (await generateMessageSpeech(id, false)) {
                 playGeneratedMessage(id);
             }
@@ -442,4 +1102,799 @@ jQuery(async () => {
         openParamsEditor(Number($(this).closest('.mes').attr('mesid')));
     });
     setInterval(refreshAllMessageButtons, 1000);
+});
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                        VOICE CALL MODULE                                ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+// ── Settings defaults ─────────────────────────────────────────────────────────
+const VC_DEFAULTS = {
+    vcEnabled: true,
+    sttLang: '',                // 留空则自动用浏览器语言（navigator.language）
+    vcLlmPresetIdx: -1,         // 使用 llmPresets 中的哪个预设
+    vcContextCount: 10,         // 注入多少条酒馆上下文
+    vcSystemPrompt: '你现在正在与用户进行语音通话。请用自然的口语回答，不要使用任何 Markdown 格式、动作描述（*动作*）或表情符号，只说出可以直接朗读的话语。一次最多回复1-2句话！！',
+    vcInjectOnEnd: true,        // 挂断后把通话记录注入聊天
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let vcActive = false;  // true when a call is in progress (suppresses regular auto-play)
+let vcState  = 'idle'; // idle | connecting | listening | recording | processing | thinking | speaking
+
+let vcAudioCtx    = null;
+let vcPlaybackCtx = null; // 专用于 TTS 播放的 AudioContext（iOS 解锁后可异步播放）
+let vcStream      = null;
+let vcAnalyser    = null;
+let vcRafId       = null;
+let vcMuted       = false;
+let vcSpeakAudio  = null;
+let vcTimerInterval = null;
+let vcSpeechRec   = null;
+let vcStartTime   = null;
+let vcStreamBuffer  = '';    // 未凑成句子的文本碎片
+let vcTtsPipeline   = [];    // Promise<Blob|null>[] 有序 TTS 队列
+let vcTtsDraining   = false; // 是否正在消费队列
+let vcGenDone       = true;  // LLM 生成是否已结束
+let vcCallLog       = [];    // [{role, content, audioItems?}] 本次通话记录
+let vcLlmAbortCtrl  = null;  // AbortController，用于中断流式 LLM
+let vcCurrentResponseAudioItems = null; // 当前 AI 回复对应的 TTS 条目（用于挂断后存档）
+
+// ── Settings helpers ──────────────────────────────────────────────────────────
+function vcLoadSettings() {
+    const set = extension_settings[MODULE_NAME];
+    for (const k in VC_DEFAULTS) {
+        if (set[k] === undefined) set[k] = VC_DEFAULTS[k];
+    }
+}
+function vc() { return extension_settings[MODULE_NAME]; }
+
+// ── State machine ─────────────────────────────────────────────────────────────
+function vcSetState(state) {
+    vcState  = state;
+    vcActive = state !== 'idle';
+
+    const icons = {
+        idle: 'fa-phone', connecting: 'fa-spinner fa-spin',
+        listening: 'fa-microphone', recording: 'fa-circle',
+        processing: 'fa-spinner fa-spin', thinking: 'fa-spinner fa-spin',
+        speaking: 'fa-volume-high',
+    };
+    const labels = {
+        idle: '', connecting: '正在接通...',
+        listening: '聆听中', recording: '录音中...',
+        processing: '识别中...', thinking: 'AI 思考中...',
+        speaking: 'AI 说话中...',
+    };
+
+    const fab = document.getElementById('vc-fab');
+    if (fab) {
+        fab.querySelector('i').className = `fa-solid ${icons[state] || 'fa-phone'}`;
+        fab.classList.toggle('vc-fab-active', state !== 'idle');
+    }
+    const statusEl = document.getElementById('vc-status');
+    if (statusEl) statusEl.textContent = (vcMuted && state === 'listening') ? '已静音' : (labels[state] ?? '');
+    const dialog = document.getElementById('vc-dialog');
+    if (dialog) dialog.dataset.state = state;
+}
+
+// ── 句子提取 ──────────────────────────────────────────────────────────────────
+function vcExtractSentences(text) {
+    const complete = [];
+    let lastIdx = 0;
+
+    // 强终止符：遇到即成句，立即送 TTS
+    const termRe = /[^。！？!?\n]*[。！？!?\n]+/g;
+    let m;
+    while ((m = termRe.exec(text)) !== null) {
+        const s = m[0].replace(/\s+/g, ' ').trim();
+        if (s.length >= 1) complete.push(s);
+        lastIdx = termRe.lastIndex;
+    }
+
+    // 软分隔（逗号/顿号/分号）：找第一个「位置 >= MIN_BEFORE」的分隔符，在此截断。
+    // ⚠️ 必须用 while 循环跳过靠前的出现，不能用 indexOf+filter：
+    //   indexOf 返回【第一个】逗号的位置，若第一个在 index<3 被 filter 过滤后，
+    //   index>=3 的第二个逗号就永远找不到，导致整条回复等到流结束才送 TTS。
+    const MIN_BEFORE = 3; // 逗号前至少 3 个字符（避免 "好，" 这类极短片段）
+    const rest = text.slice(lastIdx);
+    const SOFT_SEPS = ['\u3001', '\uff0c', '\uff1b', ',', ';'];
+    let bestSoftIdx = Infinity;
+    for (const sep of SOFT_SEPS) {
+        let idx = rest.indexOf(sep);
+        while (idx !== -1 && idx < MIN_BEFORE) idx = rest.indexOf(sep, idx + 1);
+        if (idx !== -1 && idx < bestSoftIdx) bestSoftIdx = idx;
+    }
+    if (bestSoftIdx !== Infinity) {
+        const s = rest.slice(0, bestSoftIdx + 1).replace(/\s+/g, ' ').trim();
+        if (s.length >= MIN_BEFORE) { complete.push(s); lastIdx += bestSoftIdx + 1; }
+    }
+
+    return { complete, rest: text.slice(lastIdx) };
+}
+
+// 获取当前通话使用的 TTS 参数（用于写入 serverHistory，供后续播放）
+function vcGetTtsOptions() {
+    const set = s(), ctx = getContext();
+    const charId   = ctx.characterId ?? ctx.character_id ?? ctx.name2 ?? 'global';
+    const bindings = set.characterBindingsMap?.[charId] || [];
+    const charName = (ctx.name2 || '').toLowerCase();
+    const binding  = bindings.find(b => {
+        const n = (b.targetType === TARGET_TYPE.CURRENT_CHARACTER ? ctx.name2 :
+                   b.targetType === TARGET_TYPE.CURRENT_USER      ? ctx.name1 : b.customName)?.toLowerCase();
+        return n === charName;
+    });
+    return {
+        model:       binding?.model   || set.model,
+        voiceId:     binding?.voiceId || set.voiceId,
+        speed:       Number(set.speed),
+        vol:         Number(set.vol),
+        pitch:       Number(set.pitch),
+        audioFormat: 'mp3',
+        emotion:     set.emotion || '',
+    };
+}
+
+// ── TTS 流水线（并行合成，顺序播放）──────────────────────────────────────────
+function vcEnqueueTts(text) {
+    if (!text || !vcActive) return;
+    // 立刻开始合成（不阻塞），把 Promise<Blob|null> 压入队列
+    const p = vcTtsSpeak(text).catch(() => null);
+    vcTtsPipeline.push(p);
+    // 同时记录到当前回复的音频存档（同一个 Promise，不额外消耗 API）
+    if (vcCurrentResponseAudioItems !== null) {
+        vcCurrentResponseAudioItems.push({ text, options: vcGetTtsOptions(), blob: p });
+    }
+    if (!vcTtsDraining) vcDrainTtsPipeline();
+}
+
+async function vcDrainTtsPipeline() {
+    if (vcTtsDraining) return;
+    vcTtsDraining = true;
+    let drainIdx = 0;
+    while (vcTtsPipeline.length > 0) {
+        drainIdx++;
+        const t1 = Date.now();
+        console.log(`[VC drain] 等待第 ${drainIdx} 段 TTS blob…`);
+        const blob = await vcTtsPipeline.shift(); // 等第一个合成完成
+        console.log(`[VC drain] 第 ${drainIdx} 段 TTS 完成, 耗时 ${Date.now()-t1}ms, blob=${blob?.size}bytes`);
+        if (!vcActive) break;
+        if (!blob) { console.warn(`[VC drain] 第 ${drainIdx} 段 TTS 返回 null，跳过`); continue; }
+        if (vcState === 'thinking') vcSetState('speaking');
+        console.log(`[VC drain] 第 ${drainIdx} 段开始播放`);
+        // iOS Safari 要求 play() 必须在用户手势上下文中调用。
+        // 异步链（LLM 流式 + TTS 合成）完成后已离开手势上下文，new Audio().play() 会被静默拒绝。
+        // 改用 AudioContext（在用户点击通话按钮时创建，保持解锁状态），可在任意时刻播放音频。
+        if (vcPlaybackCtx) {
+            try {
+                const arrayBuffer = await blob.arrayBuffer();
+                const audioBuffer = await vcPlaybackCtx.decodeAudioData(arrayBuffer);
+                const source = vcPlaybackCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(vcPlaybackCtx.destination);
+                vcSpeakAudio = source;
+                await new Promise(resolve => {
+                    source.onended = () => { vcSpeakAudio = null; resolve(); };
+                    source.start();
+                });
+            } catch (e) {
+                vcSpeakAudio = null;
+            }
+        } else {
+            // 回退：非 iOS 环境或 AudioContext 不可用时，使用传统方式
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            vcSpeakAudio = audio;
+            await new Promise(resolve => {
+                audio.onended = () => { URL.revokeObjectURL(url); vcSpeakAudio = null; resolve(); };
+                audio.onerror = () => { URL.revokeObjectURL(url); vcSpeakAudio = null; resolve(); };
+                audio.play().catch(resolve);
+            });
+        }
+        if (!vcActive) break;
+    }
+    vcTtsDraining = false;
+    // 队列清空且生成已结束 → 恢复聆听
+    if (vcActive && vcGenDone && vcTtsPipeline.length === 0) {
+        vcSetState('listening');
+        vcResumeListening();
+    }
+}
+
+// ── 独立 LLM 流式调用 ─────────────────────────────────────────────────────────
+function vcBuildLlmMessages(userText) {
+    const set = vc(), ctx = getContext();
+    const msgs = [];
+    const blocks = (set.vcPromptBlocks || getDefaultVcBlocks()).filter(b => b.enabled);
+
+    for (const block of blocks) {
+        if (block.id === 'charDesc') {
+            const desc = ctx.characters?.[ctx.characterId]?.description || '';
+            if (desc) msgs.push({ role: 'system', content: desc });
+        } else if (block.id === 'worldBook') {
+            const wi = [ctx.worldInfoBefore, ctx.worldInfoAfter].filter(Boolean).join('\n').trim();
+            if (wi) msgs.push({ role: 'system', content: wi });
+        } else if (block.id === 'vcSystem') {
+            if (set.vcSystemPrompt) msgs.push({ role: 'system', content: set.vcSystemPrompt });
+        } else if (block.id === 'context') {
+            const n = Math.max(0, Number(set.vcContextCount) || 10);
+            const recent = (ctx.chat || []).filter(m => !m.is_system).slice(-n);
+            for (const m of recent) msgs.push({ role: m.is_user ? 'user' : 'assistant', content: m.mes });
+        } else if (block.editable && block.content) {
+            msgs.push({ role: 'system', content: block.content });
+        }
+    }
+
+    msgs.push(...vcCallLog);
+    msgs.push({ role: 'user', content: userText });
+    return msgs;
+}
+
+async function vcStreamingLlm(userText) {
+    const preset = (s().llmPresets || [])[s().vcLlmPresetIdx];
+    if (!preset || !preset.url || !preset.model) { toastr.error('请先在语音通话设置里选择一个 LLM 预设'); vcSetState('listening'); vcResumeListening(); return; }
+    const url   = normalizeOaiUrl(preset.url);
+    const key   = (preset.key || '').trim();
+    const model = (preset.model || '').trim();
+
+    vcGenDone = false;
+    vcTtsPipeline.length = 0;
+    vcStreamBuffer = '';
+    vcCurrentResponseAudioItems = []; // 开始收集本轮回复的 TTS 条目
+
+    // ── 诊断日志（排查流式是否生效，可在控制台观察） ──────────────────────────
+    const t0 = Date.now();
+    let chunkCount = 0, ttsCount = 0;
+    const vcLog_ = (tag, msg) => console.log(`[VC ${tag} +${Date.now()-t0}ms]`, msg);
+    vcLog_('LLM', `request → ${model}`);
+
+    try {
+        vcLlmAbortCtrl = new AbortController();
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...(key ? { 'Authorization': `Bearer ${key}` } : {}) },
+            body: JSON.stringify({ model, messages: vcBuildLlmMessages(userText), stream: true }),
+            signal: vcLlmAbortCtrl.signal,
+        });
+        if (!res.ok) throw new Error(`LLM API HTTP ${res.status}`);
+        vcLog_('LLM', `response headers received (status ${res.status})`);
+
+        // 解析 SSE 流
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let sseBuf = '', fullText = '';
+
+        // 流式更新通话记录：第一个 token 到达时创建元素，后续逐字追加
+        const logContainer = document.getElementById('vc-log');
+        let liveLogEl = null;
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done || !vcActive) break;
+                chunkCount++;
+                sseBuf += dec.decode(value, { stream: true });
+                const lines = sseBuf.split('\n');
+                sseBuf = lines.pop();
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const raw = line.slice(6).trim();
+                    if (raw === '[DONE]') break;
+                    try {
+                        const delta = JSON.parse(raw).choices?.[0]?.delta?.content || '';
+                        if (!delta) continue;
+                        fullText += delta;
+                        vcStreamBuffer += delta;
+
+                        // 逐字更新 vcLog（让用户看到字在流式出现，而不是等全文才显示）
+                        if (logContainer) {
+                            if (!liveLogEl) {
+                                liveLogEl = document.createElement('div');
+                                liveLogEl.className = 'vc-log-line vc-log-ai';
+                                liveLogEl.textContent = 'TA: ';
+                                logContainer.appendChild(liveLogEl);
+                            }
+                            liveLogEl.textContent = 'TA: ' + fullText.replace(/\*[^*]*\*/g, '').replace(/\n+/g, ' ');
+                            logContainer.scrollTop = logContainer.scrollHeight;
+                        }
+
+                        const { complete, rest } = vcExtractSentences(vcStreamBuffer);
+                        vcStreamBuffer = rest;
+                        if (complete.length) {
+                            complete.forEach(seg => {
+                                ttsCount++;
+                                vcLog_('TTS-enqueue', `#${ttsCount} "${seg.slice(0,20)}…" (buf剩余:"${rest.slice(0,10)}")`);
+                                vcEnqueueTts(seg);
+                            });
+                        }
+                    } catch (_) {}
+                }
+            }
+        } finally { reader.releaseLock(); }
+
+        vcLog_('LLM', `stream done — 共 ${chunkCount} 个网络块, ${ttsCount} 段已送TTS, 剩余buffer: "${vcStreamBuffer.slice(0,30)}"`);
+
+        // 冲刷尾巴
+        const tail = vcStreamBuffer.trim();
+        vcStreamBuffer = '';
+        if (tail.length >= 2) {
+            ttsCount++;
+            vcLog_('TTS-enqueue', `#${ttsCount} tail: "${tail.slice(0,20)}"`);
+            vcEnqueueTts(tail);
+        }
+
+        // 记录到通话日志（liveLogEl 已经显示了流式文字，这里只更新数据）
+        if (vcActive && fullText) {
+            vcCallLog.push({ role: 'user', content: userText });
+            // audioItems 携带本轮所有 TTS 条目（含 blob promise），挂断时用于存档
+            vcCallLog.push({ role: 'assistant', content: fullText, audioItems: vcCurrentResponseAudioItems || [] });
+            vcCurrentResponseAudioItems = null;
+            // 若 liveLogEl 不存在（极短回复走 tail）则补一条静态日志
+            if (!liveLogEl) vcLog('ai', fullText.replace(/\*[^*]*\*/g, '').replace(/\n+/g, ' ').trim());
+        }
+    } catch (e) {
+        if (e.name !== 'AbortError') { console.error('[VC LLM]', e); toastr.error('LLM 错误: ' + e.message); }
+    }
+
+    vcGenDone = true;
+    if (!vcTtsDraining && vcTtsPipeline.length === 0 && vcActive) {
+        vcSetState('listening');
+        vcResumeListening();
+    }
+}
+
+// ── 挂断后注入通话记录 ────────────────────────────────────────────────────────
+async function vcInjectCallRecord(callLog) {
+    if (!callLog.length) return;
+    const ctx = getContext();
+    if (!ctx.chat) return;
+    const n1 = ctx.name1 || '你', n2 = ctx.name2 || 'AI';
+
+    const lines = callLog.map(m => `${m.role === 'user' ? n1 : n2}：${m.content}`);
+    const transcript = `【语音通话记录】\n${lines.join('\n')}`;
+
+    const newMsg = {
+        name: n2, is_user: false, is_system: false,
+        send_date: new Date().toLocaleString(),
+        mes: transcript, extra: { voice_call: true },
+    };
+    ctx.chat.push(newMsg);
+    const newId = ctx.chat.length - 1;
+    addOneMessage(newMsg, { scroll: true, forceId: newId });
+    saveChatDebounced();
+    toastr.success(`通话记录已注入（${callLog.length / 2 | 0} 轮对话）`);
+
+    // ── 收集通话中所有 AI 回复的 TTS 音频，存入 serverHistory ─────────────────
+    const assistantTurns = callLog.filter(m => m.role === 'assistant' && m.audioItems?.length);
+    if (!assistantTurns.length) return;
+
+    // Blob 在通话中已并行合成完毕，这里只是等待 Promise 兑现（几乎即时）
+    // 设 5s 超时以防万一用户挂断时仍有请求在途
+    const TIMEOUT = 5000;
+    const VC_TURN_PAUSE_MS = 700; // 两轮回话之间的停顿时长
+    const items = [];
+    for (let t = 0; t < assistantTurns.length; t++) {
+        // 第二轮起，先插入停顿标记（playNext 遇到 pauseMs 会 sleep 后继续）
+        if (t > 0) items.push({ pauseMs: VC_TURN_PAUSE_MS });
+
+        for (const { text, options, blob: blobP } of assistantTurns[t].audioItems) {
+            const blob = await Promise.race([blobP, new Promise(r => setTimeout(() => r(null), TIMEOUT))]);
+            if (!blob) continue;
+
+            // 用与常规 TTS 相同的 cacheKey，若之后相同文本+参数再次生成可复用服务端文件
+            const cacheKey = `tts_${simpleHash(text)}_${simpleHash(JSON.stringify(options))}`;
+            const serverPath = await uploadToSTServer(blob, `${cacheKey}.mp3`);
+
+            items.push({ text, speaker: n2, options, serverPath: serverPath || null });
+        }
+    }
+    if (!items.length) return;
+
+    // 写入 serverHistory，key 对应刚刚注入的那条消息
+    const { key } = getMessageData(newId);
+    if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
+    s().serverHistory[key].versions.push({ items, timestamp: Date.now() });
+    s().serverHistory[key].activeIndex = s().serverHistory[key].versions.length - 1;
+    saveSettingsDebounced();
+
+    // 刷新所有消息按钮，让注入消息上的 mes_quote_tts 显示 ready（绿色）
+    refreshAllMessageButtons();
+}
+
+// ── TTS (直接复用现有 MiniMax 端点) ──────────────────────────────────────────
+async function vcTtsSpeak(text) {
+    const set = s();
+    const ctx = getContext();
+    const charId  = ctx.characterId ?? ctx.character_id ?? ctx.name2 ?? 'global';
+    const bindings = set.characterBindingsMap?.[charId] || [];
+    const charName = (ctx.name2 || '').toLowerCase();
+    const binding  = bindings.find(b => {
+        const n = (b.targetType === TARGET_TYPE.CURRENT_CHARACTER ? ctx.name2 :
+                   b.targetType === TARGET_TYPE.CURRENT_USER      ? ctx.name1 : b.customName)?.toLowerCase();
+        return n === charName;
+    });
+    const res = await fetch(PROXY_ENDPOINT, {
+        method: 'POST',
+        headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            text,
+            apiHost:  set.apiHost,
+            model:    binding?.model   || set.model,
+            voiceId:  binding?.voiceId || set.voiceId,
+            speed:    Number(set.speed),
+            volume:   Number(set.vol),
+            pitch:    Number(set.pitch),
+            format:   'mp3',
+            emotion:  set.emotion || '',
+            apiKey:   (set.apiKey  || '').trim(),
+            groupId:  (set.groupId || '').trim(),
+        }),
+    });
+    if (!res.ok) throw new Error(`TTS HTTP ${res.status}`);
+    return await res.blob();
+}
+
+
+// ── 对话记录 ──────────────────────────────────────────────────────────────────
+function vcLog(speaker, text) {
+    const log = document.getElementById('vc-log');
+    if (!log) return;
+    const el = document.createElement('div');
+    el.className = `vc-log-line vc-log-${speaker}`;
+    el.textContent = (speaker === 'user' ? '你: ' : 'TA: ') + text;
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+}
+
+
+function vcResumeListening() {
+    if (vcState !== 'listening' || vcMuted) return;
+    vcStartWebSpeech();
+}
+
+// ── STT: 浏览器内置 Web Speech API ───────────────────────────────────────────
+function vcStartWebSpeech() {
+    if (vcState !== 'listening' || vcMuted) return;
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRec) {
+        toastr.error('当前浏览器不支持语音识别，请用 Chrome 或 Edge');
+        vcEndCall();
+        return;
+    }
+
+    vcSpeechRec = new SpeechRec();
+    // lang：优先用设置里的语言，否则用浏览器语言（通常已含地区如 zh-CN）
+    vcSpeechRec.lang           = vc().sttLang || navigator.language || 'zh-CN';
+    vcSpeechRec.continuous     = false;
+    vcSpeechRec.interimResults = true;   // 开启实时识别，边说边显示
+    vcSpeechRec.maxAlternatives = 1;
+
+    // vcLog 里的实时文字元素（interim 时透明度低，final 后正常）
+    const logEl = document.getElementById('vc-log');
+    let liveEl = null;
+
+    const removeLive = () => {
+        if (liveEl && !liveEl.textContent.replace('你: ', '').trim()) liveEl.remove();
+        liveEl = null;
+    };
+
+    vcSpeechRec.onresult = async (e) => {
+        // 拼接本次事件所有结果
+        let interim = '', final = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+            const t = e.results[i][0].transcript;
+            if (e.results[i].isFinal) final += t;
+            else interim += t;
+        }
+
+        // 实时更新显示（interim 用淡色斜体，final 后变正常）
+        const display = final || interim;
+        if (display && logEl) {
+            if (!liveEl) {
+                liveEl = document.createElement('div');
+                liveEl.className = 'vc-log-line vc-log-user vc-log-interim';
+                logEl.appendChild(liveEl);
+            }
+            liveEl.textContent = '你: ' + display;
+            liveEl.classList.toggle('vc-log-interim', !final);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        if (!final) return; // 还是 interim，继续等
+
+        const text = final.trim();
+        if (!text) { removeLive(); if (vcState === 'listening') vcStartWebSpeech(); return; }
+
+        // 识别完成：定稿 log 元素，转入 LLM
+        liveEl = null; // 已定稿，不再移除
+        vcSetState('thinking');
+        await vcStreamingLlm(text);
+    };
+
+    vcSpeechRec.onend = () => {
+        removeLive();
+        if (vcState === 'listening' && !vcMuted) vcStartWebSpeech();
+    };
+
+    vcSpeechRec.onerror = (e) => {
+        removeLive();
+        // aborted/no-speech/audio-capture 是正常中断，静默重启
+        if (['aborted', 'no-speech', 'audio-capture'].includes(e.error)) {
+            if (vcState === 'listening' && !vcMuted) vcStartWebSpeech();
+        } else {
+            console.warn('[VC STT] error:', e.error);
+        }
+    };
+
+    vcSpeechRec.start();
+}
+
+// ── 波形可视化 ────────────────────────────────────────────────────────────────
+function vcStartWaveform() {
+    const loop = () => {
+        if (!vcActive) return;
+        const canvas = document.getElementById('vc-canvas');
+        if (!canvas) { requestAnimationFrame(loop); return; }
+        const ctx2d = canvas.getContext('2d');
+        const W = canvas.width, H = canvas.height;
+        ctx2d.clearRect(0, 0, W, H);
+
+        if (vcAnalyser && (vcState === 'listening' || vcState === 'recording')) {
+            // 实时麦克风频谱
+            const buf  = new Uint8Array(vcAnalyser.frequencyBinCount);
+            vcAnalyser.getByteFrequencyData(buf);
+            const n = 32, step = Math.floor(buf.length / n), barW = W / n - 2;
+            for (let i = 0; i < n; i++) {
+                const v = buf[i * step] / 255;
+                const h = Math.max(3, v * H * 0.85);
+                ctx2d.fillStyle = vcState === 'recording'
+                    ? `rgba(255,90,90,${0.45 + v * 0.55})`
+                    : `rgba(70,195,130,${0.35 + v * 0.65})`;
+                ctx2d.fillRect(i * (barW + 2), (H - h) / 2, barW, h);
+            }
+        } else {
+            // 状态动画（正弦波）
+            const t   = Date.now() / 1000;
+            const amp = vcState === 'thinking' || vcState === 'processing'
+                ? 4 + Math.sin(t * 7) * 3
+                : vcState === 'speaking' ? 7 + Math.sin(t * 4) * 4 : 6;
+            const rgb = vcState === 'speaking'           ? '110,150,255'
+                      : vcState === 'thinking' || vcState === 'processing' ? '255,175,70'
+                      : '70,195,130';
+            ctx2d.strokeStyle = `rgba(${rgb},0.75)`;
+            ctx2d.lineWidth   = 2;
+            ctx2d.beginPath();
+            for (let x = 0; x <= W; x++) {
+                const y = H / 2 + Math.sin((x / W * 5 + t * 2) * Math.PI) * amp;
+                x === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
+            }
+            ctx2d.stroke();
+        }
+        requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+}
+
+// ── 通话生命周期 ──────────────────────────────────────────────────────────────
+async function vcStartCall() {
+    vcLoadSettings();
+    if (!vc().vcEnabled) return;
+
+    // 在用户手势的同步调用栈中创建 AudioContext，使其处于"解锁"状态。
+    // iOS Safari 要求 AudioContext 必须由用户手势创建，之后才能在异步代码中播放音频。
+    if (vcPlaybackCtx) { try { vcPlaybackCtx.close(); } catch (_) {} }
+    vcPlaybackCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // 停止当前正在播放的普通 TTS
+    activeAudio.pause();
+    activeAudio.src = '';
+    playbackQueue.length = 0;
+
+    vcSetState('connecting');
+
+    // 更新弹窗角色信息
+    const ctx = getContext();
+    const nameEl   = document.getElementById('vc-name');
+    const avatarEl = document.getElementById('vc-avatar');
+    const phEl     = document.getElementById('vc-avatar-placeholder');
+    if (nameEl) nameEl.textContent = ctx.name2 || 'AI';
+    const charAvatar = ctx.characters?.[ctx.characterId]?.avatar;
+    if (avatarEl) { avatarEl.src = charAvatar ? `/characters/${charAvatar}` : ''; avatarEl.style.display = charAvatar ? '' : 'none'; }
+    if (phEl)     phEl.style.display = charAvatar ? 'none' : '';
+
+    document.getElementById('vc-dialog').classList.add('vc-dialog-open');
+
+    // 计时器
+    vcStartTime = Date.now();
+    const timerEl = document.getElementById('vc-timer');
+    vcTimerInterval = setInterval(() => {
+        const sec = Math.floor((Date.now() - vcStartTime) / 1000);
+        if (timerEl) timerEl.textContent = `${String(Math.floor(sec / 60)).padStart(2,'0')}:${String(sec % 60).padStart(2,'0')}`;
+    }, 1000);
+
+    vcStartWaveform();
+
+    // iOS Safari 要求 SpeechRecognition.start() 必须在用户手势的同步调用栈中触发，
+    // 因此先同步启动识别，再异步获取麦克风流（仅用于波形显示，不影响识别）
+    vcSetState('listening');
+    vcStartWebSpeech();
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        if (!vcActive) { stream.getTracks().forEach(t => t.stop()); return; }
+        vcStream = stream;
+        vcAudioCtx = new AudioContext();
+        const src  = vcAudioCtx.createMediaStreamSource(stream);
+        vcAnalyser = vcAudioCtx.createAnalyser();
+        vcAnalyser.fftSize = 512;
+        src.connect(vcAnalyser);
+    }).catch(() => { /* 无波形也能通话 */ });
+}
+
+function vcEndCall() {
+    // 终止进行中的 LLM 请求
+    if (vcLlmAbortCtrl) { vcLlmAbortCtrl.abort(); vcLlmAbortCtrl = null; }
+    vcStreamBuffer = '';
+    vcCurrentResponseAudioItems = null; // 中途挂断时放弃当前未完成的收集
+    vcTtsPipeline.length = 0; vcTtsDraining = false; vcGenDone = true;
+    // 快照通话记录并立即清空（inject 是 async，但先把日志拍下来）
+    const logSnapshot = vcCallLog.slice();
+    vcCallLog = [];
+    if (vc().vcInjectOnEnd && logSnapshot.length) vcInjectCallRecord(logSnapshot);
+    if (vcSpeechRec)  { try { vcSpeechRec.abort(); } catch (_) {} vcSpeechRec = null; }
+    if (vcSpeakAudio)  {
+        // vcSpeakAudio 可能是 AudioBufferSourceNode（AudioContext 播放）或 HTMLAudioElement（回退）
+        try { if (typeof vcSpeakAudio.stop === 'function') vcSpeakAudio.stop(); else vcSpeakAudio.pause(); } catch (_) {}
+        vcSpeakAudio = null;
+    }
+    if (vcRafId)       { cancelAnimationFrame(vcRafId); vcRafId = null; }
+    if (vcAudioCtx)    { try { vcAudioCtx.close(); } catch (_) {} vcAudioCtx = null; }
+    if (vcPlaybackCtx) { try { vcPlaybackCtx.close(); } catch (_) {} vcPlaybackCtx = null; }
+    if (vcStream)      { vcStream.getTracks().forEach(t => t.stop()); vcStream = null; }
+    vcAnalyser = null;
+    if (vcTimerInterval) { clearInterval(vcTimerInterval); vcTimerInterval = null; }
+
+    document.getElementById('vc-dialog')?.classList.remove('vc-dialog-open');
+    const log = document.getElementById('vc-log');
+    if (log) log.innerHTML = '';
+    vcMuted = false;
+    const muteBtn = document.getElementById('vc-mute');
+    if (muteBtn) {
+        muteBtn.classList.remove('vc-btn-muted');
+        muteBtn.querySelector('i').className = 'fa-solid fa-microphone';
+    }
+    vcSetState('idle');
+}
+
+function vcToggleMute() {
+    vcMuted = !vcMuted;
+    const btn = document.getElementById('vc-mute');
+    if (btn) {
+        btn.classList.toggle('vc-btn-muted', vcMuted);
+        btn.querySelector('i').className = vcMuted ? 'fa-solid fa-microphone-slash' : 'fa-solid fa-microphone';
+    }
+    if (vcMuted && vcSpeechRec) { try { vcSpeechRec.abort(); } catch (_) {} }
+    if (!vcMuted && vcState === 'listening') vcStartWebSpeech(); // 取消静音后立刻重启识别
+    if (vcState === 'listening') vcSetState('listening'); // 刷新状态文字
+}
+
+// ── FAB + 弹窗 DOM ────────────────────────────────────────────────────────────
+function vcCreateUi() {
+    const fab = document.createElement('div');
+    fab.id    = 'vc-fab';
+    fab.title = '语音通话';
+    fab.innerHTML = '<i class="fa-solid fa-phone"></i>';
+    // 根据 vcEnabled 设置初始显示状态
+    if (vc().vcEnabled === false) fab.style.display = 'none';
+    // 附加到 <html> 而非 <body>，避免 body 上的 filter/transform（主题）
+    // 导致 position:fixed 相对 body 而非视口定位
+    document.documentElement.appendChild(fab);
+
+    // ── 拖拽逻辑（Pointer Events API，兼容鼠标 + 触摸） ──────────────────────
+    let dragging = false, wasDragged = false, ox = 0, oy = 0;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    // CSS 不再设置任何位置属性，JS 完全接管 left/top
+    const fabTakeOver = (x, y) => {
+        fab.style.left = clamp(x, 0, window.innerWidth  - 52) + 'px';
+        fab.style.top  = clamp(y, 0, window.innerHeight - 52) + 'px';
+    };
+
+    // 恢复上次保存的位置，或默认居中偏下
+    try {
+        const p = JSON.parse(localStorage.getItem('vc-fab-pos') || 'null');
+        if (p && typeof p.l === 'number') {
+            fabTakeOver(p.l, p.t);
+        } else {
+            fabTakeOver((window.innerWidth - 52) / 2, window.innerHeight - 52 - 80);
+        }
+    } catch (_) {
+        fabTakeOver((window.innerWidth - 52) / 2, window.innerHeight - 52 - 80);
+    }
+
+    fab.addEventListener('pointerdown', e => {
+        dragging = true; wasDragged = false;
+        fab.setPointerCapture(e.pointerId);
+        const r = fab.getBoundingClientRect();
+        ox = e.clientX - r.left;
+        oy = e.clientY - r.top;
+        fab.style.transition = 'box-shadow 0.18s ease'; // 拖动时关闭位移动画
+        e.preventDefault();
+    }, { passive: false });
+
+    fab.addEventListener('pointermove', e => {
+        if (!dragging) return;
+        fabTakeOver(e.clientX - ox, e.clientY - oy);
+        wasDragged = true;
+        e.preventDefault();
+    }, { passive: false });
+
+    const onPointerEnd = e => {
+        if (!dragging) return;
+        dragging = false;
+        fab.releasePointerCapture(e.pointerId);
+        fab.style.transition = ''; // 恢复动画
+        if (wasDragged) {
+            const r = fab.getBoundingClientRect();
+            try { localStorage.setItem('vc-fab-pos', JSON.stringify({ l: r.left, t: r.top })); } catch (_) {}
+        }
+    };
+    fab.addEventListener('pointerup',     onPointerEnd);
+    fab.addEventListener('pointercancel', onPointerEnd);
+
+    // 拖动后忽略 click，未拖动才触发通话
+    fab.addEventListener('click', () => {
+        if (wasDragged) { wasDragged = false; return; }
+        vcState === 'idle' ? vcStartCall() : vcEndCall();
+    });
+
+    // 窗口缩放时把悬浮球夹回可视区
+    window.addEventListener('resize', () => {
+        if (fab.style.left) {
+            fab.style.left = clamp(parseFloat(fab.style.left), 0, window.innerWidth  - 52) + 'px';
+            fab.style.top  = clamp(parseFloat(fab.style.top),  0, window.innerHeight - 52) + 'px';
+        }
+    }, { passive: true });
+
+    const dialog = document.createElement('div');
+    dialog.id = 'vc-dialog';
+    dialog.innerHTML = `
+        <div class="vc-card">
+            <div class="vc-avatar-wrap">
+                <div class="vc-ripple r1"></div>
+                <div class="vc-ripple r2"></div>
+                <div class="vc-ripple r3"></div>
+                <img id="vc-avatar" src="" alt="" style="display:none">
+                <div id="vc-avatar-placeholder" class="vc-avatar-placeholder">
+                    <i class="fa-solid fa-robot"></i>
+                </div>
+            </div>
+            <div id="vc-name" class="vc-name">接通中...</div>
+            <div class="vc-meta">
+                <span id="vc-timer">00:00</span>
+                <span class="vc-dot">·</span>
+                <span id="vc-status">连接中</span>
+            </div>
+            <canvas id="vc-canvas" width="240" height="48"></canvas>
+            <div id="vc-log" class="vc-log"></div>
+            <div class="vc-controls">
+                <button id="vc-mute" class="vc-btn" title="静音">
+                    <i class="fa-solid fa-microphone"></i><span>静音</span>
+                </button>
+                <button id="vc-hangup" class="vc-btn vc-btn-end" title="挂断">
+                    <i class="fa-solid fa-phone-slash"></i><span>挂断</span>
+                </button>
+            </div>
+        </div>`;
+    document.documentElement.appendChild(dialog);
+    document.getElementById('vc-hangup').addEventListener('click', vcEndCall);
+    document.getElementById('vc-mute').addEventListener('click', vcToggleMute);
+}
+
+// ── 入口（独立 jQuery 块，不改动原有代码） ────────────────────────────────────
+jQuery(async () => {
+    vcLoadSettings();
+    vcCreateUi();
+
+    // 通话期间屏蔽普通自动播放（已由通话模块接管）
+    // CHARACTER_MESSAGE_RENDERED 无需在此处理，vcStreamingLlm 直接处理 LLM 流
 });
