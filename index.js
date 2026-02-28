@@ -34,6 +34,8 @@ const defaults = {
     regexPresets: [],          // [{name, rules:[...]}]
     vcPromptBlocks: null,      // null = 默认顺序
     vcPromptTemplates: [],     // [{name, blocks:[...], systemPrompt:''}]
+    llmPreProcessRules: [],    // [{id, enabled, name, pattern, mode}] 发送前预处理（剔除think等）
+    showBubbles: false,        // 在消息下方注入可点击语音气泡
 };
 
 let playbackQueue = [], isPlaying = false, clickTimer = null;
@@ -43,6 +45,66 @@ const localAudioCache = new Map();
 function s() { return extension_settings[MODULE_NAME]; }
 
 function escHtml(v) { return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// 支持 /pattern/ 和 /pattern/flags 两种写法，也支持直接输入 pattern
+function parsePattern(str) {
+    const s = (str || '').trim();
+    if (s.startsWith('/')) {
+        const last = s.lastIndexOf('/');
+        if (last > 0) return s.slice(1, last);
+    }
+    return s;
+}
+
+// 加载当前角色/聊天所关联的所有世界书条目
+async function loadAllWbEntries() {
+    const ctx = getContext();
+    const worlds = new Set();
+    const charWorld = ctx.characters?.[ctx.characterId]?.data?.extensions?.world;
+    if (charWorld) worlds.add(charWorld);
+    const chatWorld = ctx.chatMetadata?.world_info;
+    if (chatWorld) worlds.add(chatWorld);
+    const allEntries = [];
+    for (const worldName of worlds) {
+        const data = await ctx.loadWorldInfo(worldName);
+        if (data?.entries) {
+            for (const entry of Object.values(data.entries)) {
+                if (!entry.disable) {
+                    allEntries.push({
+                        key: `${worldName}::${entry.uid}`,
+                        title: entry.comment || `条目 ${entry.uid}`,
+                        content: entry.content || '',
+                        worldName,
+                        uid: entry.uid,
+                    });
+                }
+            }
+        }
+    }
+    return allEntries;
+}
+
+// 对文本应用预处理规则（发送给 LLM 前清洗，如剔除思维链标签）
+function applyPreProcessRules(text) {
+    const rules = (s().llmPreProcessRules || []).filter(r => r.enabled && r.pattern);
+    if (!rules.length) return text;
+    for (const rule of rules) {
+        let re;
+        try { re = new RegExp(parsePattern(rule.pattern), 'gs'); } catch(e) { continue; }
+        if (rule.mode === 'extract') {
+            const matches = [];
+            let m;
+            while ((m = re.exec(text)) !== null) {
+                const t = (m[1] !== undefined ? m[1] : m[0]).trim();
+                if (t) matches.push(t);
+            }
+            if (matches.length) text = matches.join('\n');
+        } else {
+            text = text.replace(re, '');
+        }
+    }
+    return text.trim();
+}
 
 function getBuiltinQuoteRule() {
     return {
@@ -199,14 +261,14 @@ async function formatWithSecondaryApi(m) {
             const url = normalizeOaiUrl(preset.url);
             const data = await proxyFetch(url, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', ...(preset.key ? { 'Authorization': `Bearer ${preset.key.trim()}` } : {}) },
-                body: { model: preset.model, messages: [{ role: 'system', content: prompt }, { role: 'user', content: m.mes }], temperature: 0.1 }
+                body: { model: preset.model, messages: [{ role: 'system', content: prompt }, { role: 'user', content: applyPreProcessRules(m.mes) }], temperature: 0.1 }
             });
             text = data.choices?.[0]?.message?.content;
         } else {
             const baseUrl = (preset.url || '').trim().replace(/\/+$/, '');
             const gUrl = `${baseUrl}/v1beta/models/${preset.model}:generateContent`;
             const gHeaders = { 'Content-Type': 'application/json', ...(preset.key ? { 'x-goog-api-key': preset.key.trim() } : {}) };
-            const data = await proxyFetch(gUrl, { method: 'POST', headers: gHeaders, body: { contents: [{ role: 'user', parts: [{ text: `System Prompt: ${prompt}\n\nUser Message: ${m.mes}` }] }] } });
+            const data = await proxyFetch(gUrl, { method: 'POST', headers: gHeaders, body: { contents: [{ role: 'user', parts: [{ text: `System Prompt: ${prompt}\n\nUser Message: ${applyPreProcessRules(m.mes)}` }] }] } });
             text = data.candidates?.[0]?.content?.parts?.[0]?.text;
         }
         const match = text.match(/\{[\s\S]*\}/); if (!match) throw new Error('AI 无有效 JSON');
@@ -250,7 +312,7 @@ async function generateMessageSpeech(id, forced = false) {
                 // 先运行所有 extract 规则，收集要读的段落
                 let extracted = [];
                 for (const rule of rules.filter(r => r.mode === 'extract')) {
-                    let re; try { re = new RegExp(rule.pattern, 'g'); } catch(e) { continue; }
+                    let re; try { re = new RegExp(parsePattern(rule.pattern), 'g'); } catch(e) { continue; }
                     let qm;
                     while ((qm = re.exec(cleanText)) !== null) {
                         const t = (qm[1]?.replace(/\n+/g, ' ').trim()) || (qm[0]?.replace(/\n+/g, ' ').trim());
@@ -259,7 +321,7 @@ async function generateMessageSpeech(id, forced = false) {
                 }
                 // 再运行所有 exclude 规则，过滤掉匹配的段落
                 for (const rule of rules.filter(r => r.mode === 'exclude')) {
-                    let re; try { re = new RegExp(rule.pattern, 'g'); } catch(e) { continue; }
+                    let re; try { re = new RegExp(parsePattern(rule.pattern), 'g'); } catch(e) { continue; }
                     extracted = extracted.filter(seg => !re.test(seg.text));
                 }
                 raw = extracted;
@@ -269,8 +331,42 @@ async function generateMessageSpeech(id, forced = false) {
         if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
         s().serverHistory[key].versions.push({ items, timestamp: Date.now() });
         s().serverHistory[key].activeIndex = s().serverHistory[key].versions.length - 1;
-        saveSettingsDebounced(); refreshAllMessageButtons(); return true;
+        saveSettingsDebounced(); refreshAllMessageButtons(); injectBubbles(id); return true;
     } catch (e) { toastr.error('生成失败: ' + e.message); return false; }
+}
+
+// 仅提取文本段落（无 API 调用）用于气泡预注入。格式化模式下无法预提取，返回 false。
+function extractSegmentsOnly(id) {
+    if (!s().showBubbles) return false;
+    const { message, key } = getMessageData(id);
+    if (!message || message.is_system || (s().onlyCharacter && message.is_user)) return false;
+    if (s().serverHistory[key]?.versions?.length) return true; // 已有历史，跳过
+    if (message?.extra?.voice_call) return false; // VC 通话记录由 vcInjectCallRecord 单独管理
+    if (/class="/.test(message.mes)) return false; // 跳过含 HTML 属性的系统注入消息
+    if (s().formatterEnabled) return false; // 格式化需要 API，跳过预提取
+    const cleanText = s().ignoreCodeBlocks ? message.mes.replace(/```[\s\S]*?```/g, ' ') : message.mes;
+    const rules = (s().regexRules || []).filter(r => r.enabled);
+    if (!rules.length) return false;
+    let extracted = [];
+    for (const rule of rules.filter(r => r.mode === 'extract')) {
+        let re; try { re = new RegExp(parsePattern(rule.pattern), 'g'); } catch(e) { continue; }
+        let qm;
+        while ((qm = re.exec(cleanText)) !== null) {
+            const t = (qm[1]?.replace(/\n+/g, ' ').trim()) || (qm[0]?.replace(/\n+/g, ' ').trim());
+            if (t) extracted.push({ text: t, speaker: message.name });
+        }
+    }
+    for (const rule of rules.filter(r => r.mode === 'exclude')) {
+        let re; try { re = new RegExp(parsePattern(rule.pattern), 'g'); } catch(e) { continue; }
+        extracted = extracted.filter(seg => !re.test(seg.text));
+    }
+    if (!extracted.length) return false;
+    const items = extracted.map(seg => ({ text: seg.text, speaker: seg.speaker || message.name, options: buildSynthesisOptions(seg, message), serverPath: null }));
+    if (!s().serverHistory[key]) s().serverHistory[key] = { activeIndex: 0, versions: [] };
+    s().serverHistory[key].versions.push({ items, timestamp: Date.now() });
+    s().serverHistory[key].activeIndex = s().serverHistory[key].versions.length - 1;
+    saveSettingsDebounced();
+    return true;
 }
 
 async function playGeneratedMessage(id) {
@@ -283,14 +379,145 @@ async function playGeneratedMessage(id) {
     return true;
 }
 
+function isBubbleCached(item) {
+    if (!item || item.pauseMs) return false;
+    if (item.serverPath) return true;
+    const cacheKey = `tts_${simpleHash(item.text)}_${simpleHash(JSON.stringify(item.options))}`;
+    return localAudioCache.has(cacheKey);
+}
+
+function refreshBubbleStates(mesid) {
+    const { key } = getMessageData(mesid);
+    const h = s().serverHistory[key];
+    const items = h?.versions?.[h.activeIndex]?.items || [];
+    const mesEl = document.querySelector(`#chat .mes[mesid="${mesid}"]`);
+    if (!mesEl) return;
+    mesEl.querySelectorAll('.mm-bubble').forEach(bubble => {
+        const item = items[Number(bubble.dataset.segidx)];
+        if (item) bubble.classList.toggle('mm-bubble-cached', isBubbleCached(item));
+    });
+}
+
 function refreshAllMessageButtons() {
     document.querySelectorAll('#chat .mes[mesid]').forEach(el => {
-        const id = el.getAttribute('mesid'), { key } = getMessageData(id);
+        const id = el.getAttribute('mesid'), { message, key } = getMessageData(id);
+        if (!message || message.is_system || /class="/.test(message.mes || '')) return; // 跳过系统/HTML消息
         const extra = el.querySelector('.extraMesButtons'); if (!extra) return;
         let btn = el.querySelector('.mes_quote_tts');
         if (!btn) { btn = document.createElement('div'); btn.className = 'mes_button mes_quote_tts fa-solid fa-volume-high'; extra.appendChild(btn); }
-        btn.classList.toggle('ready', !!(s().serverHistory[key]?.versions?.length > 0));
+        const h = s().serverHistory[key];
+        let ready;
+        if (s().showBubbles && h?.versions?.[h.activeIndex]?.items?.length > 0) {
+            // 气泡模式：全部段落都已缓存才亮绿灯
+            ready = h.versions[h.activeIndex].items.filter(it => !it.pauseMs && it.text).every(isBubbleCached);
+        } else {
+            ready = !!(h?.versions?.length > 0);
+        }
+        btn.classList.toggle('ready', ready);
     });
+}
+
+// 创建一个气泡元素（item 为 serverHistory 中的段落对象）
+function makeBubble(mesid, segidx, item, withText = false) {
+    const el = document.createElement('span');
+    el.className = 'mm-bubble';
+    el.dataset.mesid = mesid;
+    el.dataset.segidx = segidx;
+    el.title = item.text;
+    el.innerHTML = withText
+        ? `<i class="fa-solid fa-volume-low"></i>${escHtml(item.text.length > 20 ? item.text.slice(0, 20) + '…' : item.text)}`
+        : `<i class="fa-solid fa-volume-low"></i>`;
+    if (isBubbleCached(item)) el.classList.add('mm-bubble-cached');
+    return el;
+}
+
+// 在 container 的文本节点里找到 searchText，将其所在文本节点截断后插入 insertEl
+// 返回 true 表示注入成功
+function injectAfterText(container, searchText, insertEl) {
+    if (!searchText) return false;
+    // 过滤器：跳过已注入气泡内部的节点
+    const filter = {
+        acceptNode: n => n.parentElement.closest('.mm-bubble, .mm-bubble-strip')
+            ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+    };
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, filter);
+    let node;
+    while ((node = walker.nextNode())) {
+        const idx = node.textContent.indexOf(searchText);
+        if (idx < 0) continue;
+        const endIdx = idx + searchText.length;
+        const after = node.textContent.slice(endIdx);
+        node.textContent = node.textContent.slice(0, endIdx);
+        const parent = node.parentNode, next = node.nextSibling;
+        parent.insertBefore(insertEl, next);
+        if (after) parent.insertBefore(document.createTextNode(after), insertEl.nextSibling);
+        return true;
+    }
+    return false;
+}
+
+function injectBubbles(mesid) {
+    if (!s().showBubbles) return;
+    if (document.getElementById('minimax_quote_tts_editor')) return; // 参数编辑器打开时不注入
+    const { message, key } = getMessageData(mesid);
+    // 跳过系统消息；跳过含 HTML class 属性的注入消息（除非是 VC 通话记录）
+    if (!message || message.is_system) return;
+    if (!message.extra?.voice_call && /class="/.test(message.mes || '')) return;
+    const h = s().serverHistory[key];
+    const mesEl = document.querySelector(`#chat .mes[mesid="${mesid}"]`);
+    if (!mesEl) return;
+    const textEl = mesEl.querySelector('.mes_text');
+    if (!textEl) return;
+    // 保留原始（含 pauseMs）数组供索引用，过滤后的用于实际注入
+    const allItems = h?.versions?.[h.activeIndex]?.items || [];
+    const items = allItems.map((it, idx) => ({ it, idx })).filter(({ it }) => !it.pauseMs && it.text);
+
+    // 版本标记 + DOM 实际气泡数双重检查：
+    // ST 有时仅替换 .mes_text 的 innerHTML 而不换元素，会抹掉气泡但保留 data-mm-bub-ver。
+    const ver = `${key}:${h?.activeIndex}:${items.length}`;
+    const actualBubbles = textEl.querySelectorAll('.mm-bubble').length;
+    if (textEl.dataset.mmBubVer === ver && actualBubbles === items.length) {
+        // 版本吻合且气泡数正确 → 只刷新缓存状态，不重注入
+        refreshBubbleStates(mesid);
+        return;
+    }
+
+    // 清除旧气泡及版本标记
+    textEl.querySelectorAll('.mm-bubble').forEach(el => el.remove());
+    textEl.querySelector('.mm-bubble-strip')?.remove();
+    if (!items.length) return; // 无数据时不写版本，让下次能重试
+
+    const unmatched = [];
+    items.forEach(({ it: item, idx }) => {
+        // segidx 使用原始数组下标，确保点击时能正确命中 items[segidx]（pauseMs 项不计）
+        const bubble = makeBubble(mesid, idx, item, false); // 内联：仅图标
+        if (!injectAfterText(textEl, item.text, bubble)) {
+            unmatched.push({ item, idx }); // 找不到则归入底部条
+        }
+    });
+
+    // 没找到内联位置的放底部条（LLM 模式或 markdown 改变了文字）
+    if (unmatched.length) {
+        const strip = document.createElement('div');
+        strip.className = 'mm-bubble-strip';
+        unmatched.forEach(({ item, idx }) => strip.appendChild(makeBubble(mesid, idx, item, true)));
+        textEl.appendChild(strip);
+    }
+    textEl.dataset.mmBubVer = ver;
+}
+
+function refreshAllBubbles() {
+    if (!s().showBubbles) return;
+    document.querySelectorAll('#chat .mes[mesid]').forEach(el => {
+        const id = Number(el.getAttribute('mesid'));
+        extractSegmentsOnly(id); // 未生成过语音时预提取段落，已有历史则直接跳过
+        injectBubbles(id);
+    });
+}
+
+function removeAllBubbles() {
+    document.querySelectorAll('.mm-bubble, .mm-bubble-strip').forEach(el => el.remove());
+    document.querySelectorAll('[data-mm-bub-ver]').forEach(el => el.removeAttribute('data-mm-bub-ver'));
 }
 
 function openParamsEditor(id) {
@@ -342,14 +569,19 @@ function openParamsEditor(id) {
             saveSettingsDebounced(); refreshAllMessageButtons();
             render();
         });
-        $('#minimax_quote_tts_editor .editor-close').on('click', () => $('#minimax_quote_tts_editor').remove());
+        const invalidateBubbles = () => {
+            const textEl = document.querySelector(`#chat .mes[mesid="${id}"] .mes_text`);
+            if (textEl) textEl.removeAttribute('data-mm-bub-ver');
+            setTimeout(() => { injectBubbles(id); refreshBubbleStates(id); refreshAllMessageButtons(); }, 100);
+        };
+        $('#minimax_quote_tts_editor .editor-close').on('click', () => { $('#minimax_quote_tts_editor').remove(); invalidateBubbles(); });
         $('#minimax_quote_tts_editor .edit-v').on('change input', function(){ 
             const p = $(this).data('prop'), idx = $(this).data('idx'), val = $(this).val();
             if(p === 'speaker'){ v.items[idx].speaker = val; const b = findCharacterBinding(val); if(b){ v.items[idx].options.model = b.model || s().model; v.items[idx].options.voiceId = b.voiceId || s().voiceId; render(); } }
             else { v.items[idx].options[p] = val; } v.items[idx].serverPath = null;
         });
         $('#minimax_quote_tts_editor .editor-save-only').on('click', () => { saveSettingsDebounced(); toastr.success('已保存'); });
-        $('#minimax_quote_tts_editor .editor-confirm').on('click', () => { saveSettingsDebounced(); $('#minimax_quote_tts_editor').remove(); refreshAllMessageButtons(); });
+        $('#minimax_quote_tts_editor .editor-confirm').on('click', () => { saveSettingsDebounced(); $('#minimax_quote_tts_editor').remove(); refreshAllMessageButtons(); invalidateBubbles(); });
         $('#minimax_quote_tts_editor select.edit-v').each(function(){ $(this).val(v.items[$(this).data('idx')].options.model); });
     }; render();
 }
@@ -433,18 +665,45 @@ function renderRules() {
         el.innerHTML = `
             <input type="checkbox" class="mm-rule-toggle" ${rule.enabled ? 'checked' : ''} title="启用/禁用">
             <input class="text_pole mm-rule-name"    placeholder="规则名" value="${escHtml(rule.name||'')}">
-            <input class="text_pole mm-rule-pattern" placeholder="正则表达式" value="${escHtml(rule.pattern||'')}">
+            <input class="text_pole mm-rule-pattern" placeholder="正则 或 /pattern/" value="${escHtml(rule.pattern||'')}">
             <select class="text_pole mm-rule-mode" style="max-width:68px">
                 <option value="extract" ${rule.mode==='extract'?'selected':''}>提取</option>
                 <option value="exclude" ${rule.mode==='exclude'?'selected':''}>排除</option>
             </select>
-            <button class="menu_button mm-rule-del" title="删除" style="padding:4px 10px;flex-shrink:0">×</button>
+            <button class="menu_button mm-rule-del" title="删除">×</button>
         `;
         el.querySelector('.mm-rule-toggle').addEventListener('change', function() { rules[i].enabled = this.checked; saveSettingsDebounced(); });
         el.querySelector('.mm-rule-name').addEventListener('input',    function() { rules[i].name = this.value; saveSettingsDebounced(); });
         el.querySelector('.mm-rule-pattern').addEventListener('input', function() { rules[i].pattern = this.value; saveSettingsDebounced(); });
         el.querySelector('.mm-rule-mode').addEventListener('change',   function() { rules[i].mode = this.value; saveSettingsDebounced(); });
         el.querySelector('.mm-rule-del').addEventListener('click',     () => { rules.splice(i, 1); saveSettingsDebounced(); renderRules(); });
+        container.appendChild(el);
+    });
+}
+
+function renderPreProcessRules() {
+    const container = document.getElementById('mm_pre_rule_rows');
+    if (!container) return;
+    container.innerHTML = '';
+    const rules = s().llmPreProcessRules || [];
+    rules.forEach((rule, i) => {
+        const el = document.createElement('div');
+        el.className = 'mm-rule-row';
+        el.innerHTML = `
+            <input type="checkbox" class="mm-rule-toggle" ${rule.enabled ? 'checked' : ''} title="启用/禁用">
+            <input class="text_pole mm-rule-name"    placeholder="规则名" value="${escHtml(rule.name||'')}">
+            <input class="text_pole mm-rule-pattern" placeholder="正则 或 /pattern/" value="${escHtml(rule.pattern||'')}">
+            <select class="text_pole mm-rule-mode" style="max-width:68px">
+                <option value="extract" ${rule.mode==='extract'?'selected':''}>提取</option>
+                <option value="exclude" ${rule.mode==='exclude'?'selected':''}>排除</option>
+            </select>
+            <button class="menu_button mm-rule-del" title="删除">×</button>
+        `;
+        el.querySelector('.mm-rule-toggle').addEventListener('change', function() { rules[i].enabled = this.checked; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-name').addEventListener('input',    function() { rules[i].name = this.value; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-pattern').addEventListener('input', function() { rules[i].pattern = this.value; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-mode').addEventListener('change',   function() { rules[i].mode = this.value; saveSettingsDebounced(); });
+        el.querySelector('.mm-rule-del').addEventListener('click',     () => { rules.splice(i, 1); saveSettingsDebounced(); renderPreProcessRules(); });
         container.appendChild(el);
     });
 }
@@ -476,6 +735,7 @@ function renderVcBlocks() {
                 </div>
             </div>
             ${block.hint ? `<div class="mm-block-hint">${block.hint}</div>` : ''}
+            ${block.id === 'worldBook' ? `<div class="mm-block-content" style="margin-top:6px;display:flex;align-items:center;gap:8px"><span class="mm-wb-count" style="font-size:0.8rem;opacity:0.65">${block.selectedEntries?.length ? `已选 ${block.selectedEntries.length} 条` : '全部注入（未指定条目）'}</span><button class="menu_button mm-wb-manage" style="padding:2px 10px;font-size:0.78rem">选择条目</button></div>` : ''}
             ${block.editable ? `<div class="mm-block-content"><textarea class="mm-block-textarea text_pole" style="min-height:64px;margin-top:6px;width:100%">${textareaVal}</textarea></div>` : ''}
         `;
         el.querySelector('.mm-block-toggle').addEventListener('change', function() {
@@ -488,6 +748,30 @@ function renderVcBlocks() {
                 saveSettingsDebounced();
             });
         }
+        el.querySelector('.mm-wb-manage')?.addEventListener('click', async () => {
+            const blockRef = s().vcPromptBlocks[i];
+            let entries;
+            try { entries = await loadAllWbEntries(); } catch(e) { toastr.error('加载世界书失败: ' + e.message); return; }
+            if (!entries.length) { toastr.warning('未找到当前角色的世界书条目，请确保已为角色绑定世界书'); return; }
+            const selected = new Set(blockRef.selectedEntries || []);
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'max-height:55vh;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:4px';
+            entries.forEach(entry => {
+                const label = document.createElement('label');
+                label.style.cssText = 'display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:6px 8px;border-radius:6px;background:rgba(128,128,128,0.06);user-select:none';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox'; cb.checked = selected.has(entry.key);
+                cb.style.cssText = 'margin-top:2px;flex-shrink:0';
+                const info = document.createElement('div');
+                info.style.cssText = 'flex:1;min-width:0;font-size:0.85rem';
+                info.innerHTML = `<div style="font-weight:600">${escHtml(entry.title)}</div><div style="opacity:0.5;font-size:0.78rem;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${escHtml(entry.content.slice(0, 120))}${entry.content.length > 120 ? '…' : ''}</div>`;
+                cb.addEventListener('change', () => { cb.checked ? selected.add(entry.key) : selected.delete(entry.key); });
+                label.appendChild(cb); label.appendChild(info);
+                wrap.appendChild(label);
+            });
+            const ok = await callGenericPopup(wrap, POPUP_TYPE.CONFIRM, '选择注入的世界书条目', { wide: true, okButton: '确认', cancelButton: '取消' });
+            if (ok) { blockRef.selectedEntries = [...selected]; saveSettingsDebounced(); renderVcBlocks(); }
+        });
         el.querySelector('.mm-del-block')?.addEventListener('click', () => {
             s().vcPromptBlocks.splice(i, 1); saveSettingsDebounced(); renderVcBlocks();
         });
@@ -609,6 +893,7 @@ function openConfigPanel() {
         <div class="mm-row"><label>语速</label><input id="mm_speed" class="text_pole" type="number" step="0.1" min="0.5" max="2" style="max-width:80px"></div>
         <div class="mm-row"><label>音量</label><input id="mm_vol" class="text_pole" type="number" step="0.1" min="0" max="10" style="max-width:80px"></div>
         <div class="mm-row"><label>自动播放</label><input id="mm_autoplay" type="checkbox"></div>
+        <div class="mm-row"><label>语音气泡</label><input id="mm_show_bubbles" type="checkbox"><span class="mm-inline-hint">在消息下方注入气泡，点击气泡单独收听该段语音</span></div>
         <div class="mm-row"><button id="mm_test_tts" class="menu_button"><i class="fa-solid fa-play"></i> 测试语音</button></div>
         <div class="mm-section-title">语音库 <button id="mm_add_voice" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+ 添加</button></div>
         <p class="mm-desc">为语音 ID 起名，便于在角色绑定中按名选择。</p>
@@ -640,11 +925,11 @@ function openConfigPanel() {
 
         <div class="mm-section-title">正则文本规则 <button id="mm_add_rule" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+ 添加</button></div>
         <div class="mm-rule-header-row">
-          <span style="flex:0 0 20px"></span>
-          <span style="flex:1.2">名称</span>
-          <span style="flex:2">正则表达式</span>
-          <span style="flex:0 0 68px">模式</span>
-          <span style="flex:0 0 36px"></span>
+          <span class="mm-rule-toggle"></span>
+          <span class="mm-rule-name">名称</span>
+          <span class="mm-rule-pattern">正则表达式</span>
+          <span class="mm-rule-mode">模式</span>
+          <span class="mm-rule-del"></span>
         </div>
         <div id="mm_rule_rows"></div>
         <div class="mm-section-title" style="margin-top:12px">规则预设</div>
@@ -673,6 +958,17 @@ function openConfigPanel() {
           <label style="padding-top:6px">系统提示词</label>
           <textarea id="mm_f_prompt" class="text_pole" style="flex:1;width:0"></textarea>
         </div>
+
+        <div class="mm-section-title" style="margin-top:16px">预处理规则 <button id="mm_add_pre_rule" class="menu_button" style="font-size:0.8rem;padding:3px 10px">+ 添加</button></div>
+        <p class="mm-desc">发送给副LLM或语音通话LLM之前，对消息文本执行正则处理（如剔除 &lt;think&gt; 思维链标签）。排除=删除匹配内容，提取=仅保留匹配内容。</p>
+        <div class="mm-rule-header-row">
+          <span class="mm-rule-toggle"></span>
+          <span class="mm-rule-name">名称</span>
+          <span class="mm-rule-pattern">正则表达式</span>
+          <span class="mm-rule-mode">模式</span>
+          <span class="mm-rule-del"></span>
+        </div>
+        <div id="mm_pre_rule_rows"></div>
       </div>
 
       <!-- Tab: 语音通话 -->
@@ -721,7 +1017,7 @@ function openConfigPanel() {
                 document.querySelector(`#mm-config-dialog .mm-tab-panel[data-panel="${t}"]`).classList.add('active');
                 if (t === 'vc')     { renderVcBlocks(); }
                 if (t === 'tts')    { renderVoiceLibrary(); refreshVoiceSelects(); renderBindings(); }
-                if (t === 'format') { renderRules(); renderRegexPresets(); }
+                if (t === 'format') { renderRules(); renderRegexPresets(); renderPreProcessRules(); }
             });
         });
 
@@ -746,6 +1042,11 @@ function openConfigPanel() {
             s().autoPlay = document.getElementById('mm_autoplay').checked;
             saveSettingsDebounced();
         };
+        document.getElementById('mm_show_bubbles').addEventListener('change', function() {
+            s().showBubbles = this.checked;
+            saveSettingsDebounced();
+            if (this.checked) refreshAllBubbles(); else removeAllBubbles();
+        });
         ['mm_key','mm_gid','mm_apihost','mm_model','mm_voice_sel','mm_voice','mm_speed','mm_vol','mm_autoplay'].forEach(id => {
             const el = document.getElementById(id);
             el.addEventListener('input', syncTts);
@@ -781,6 +1082,11 @@ function openConfigPanel() {
             if (!s().regexRules) s().regexRules = [];
             s().regexRules.push({ id: 'rule-' + Date.now(), enabled: true, name: '新规则', pattern: '', flags: 'g', mode: 'extract' });
             renderRules(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_add_pre_rule').addEventListener('click', () => {
+            if (!s().llmPreProcessRules) s().llmPreProcessRules = [];
+            s().llmPreProcessRules.push({ id: 'pre-' + Date.now(), enabled: true, name: '新规则', pattern: '', mode: 'exclude' });
+            renderPreProcessRules(); saveSettingsDebounced();
         });
         document.getElementById('mm_regex_save_p').addEventListener('click', () => {
             const name = prompt('预设名称：'); if (!name) return;
@@ -1030,7 +1336,8 @@ function openConfigPanel() {
         document.getElementById('mm_model').value   = set.model   || 'speech-02-hd';
         document.getElementById('mm_speed').value   = set.speed   ?? 1;
         document.getElementById('mm_vol').value     = set.vol     ?? 1;
-        document.getElementById('mm_autoplay').checked = set.autoPlay !== false;
+        document.getElementById('mm_autoplay').checked    = set.autoPlay !== false;
+        document.getElementById('mm_show_bubbles').checked = set.showBubbles || false;
 
         // Voice selector
         renderVoiceLibrary(); refreshVoiceSelects();
@@ -1054,7 +1361,7 @@ function openConfigPanel() {
         document.getElementById('mm_vc_ctx_count').value = set.vcContextCount || 10;
         upVcTemplates();
 
-        renderRules(); renderRegexPresets();
+        renderRules(); renderRegexPresets(); renderPreProcessRules();
         renderVcBlocks(); renderBindings();
     }
     document.getElementById('mm-config-mask').classList.add('mm-config-open');
@@ -1064,7 +1371,7 @@ jQuery(async () => {
     loadSettings(); createUi();
     let timer, longP;
     
-    // --- 自动播放监听 ---
+    // --- 自动播放 + 气泡注入 ---
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, async (id) => {
         const ctx = getContext();
         if (ctx.chat?.[id]?.extra?.voice_call) return; // 跳过通话记录注入的消息
@@ -1072,7 +1379,14 @@ jQuery(async () => {
             if (await generateMessageSpeech(id, false)) {
                 playGeneratedMessage(id);
             }
+        } else {
+            // 无自动播放时，若启用了气泡则预提取段落（纯正则，不调用 API）
+            extractSegmentsOnly(id);
         }
+        injectBubbles(id); // 若该消息已有段落数据则注入气泡
+    });
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        setTimeout(refreshAllBubbles, 600); // 等待消息渲染完毕后批量注入
     });
 
     $(document).on('mousedown touchstart', '.mes_quote_tts', function(){
@@ -1101,7 +1415,35 @@ jQuery(async () => {
         e.preventDefault(); if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
         openParamsEditor(Number($(this).closest('.mes').attr('mesid')));
     });
-    setInterval(refreshAllMessageButtons, 1000);
+    setInterval(() => { refreshAllMessageButtons(); refreshAllBubbles(); }, 1000);
+
+    // --- 气泡点击播放 ---
+    $(document).on('click', '.mm-bubble', async function() {
+        if ($(this).hasClass('mm-bubble-loading') || $(this).hasClass('mm-bubble-playing')) return;
+        const mesid = Number($(this).data('mesid'));
+        const segidx = Number($(this).data('segidx'));
+        const { key } = getMessageData(mesid);
+        const h = s().serverHistory[key];
+        const item = h?.versions?.[h.activeIndex]?.items?.[segidx];
+        if (!item) return;
+        const $b = $(this);
+        $b.addClass('mm-bubble-loading');
+        try {
+            const blob = await getAudioBlob(item);
+            $b.removeClass('mm-bubble-loading').addClass('mm-bubble-playing');
+            // 请求完成后立即刷新缓存状态（气泡变绿，喇叭全绿检查）
+            refreshBubbleStates(mesid);
+            refreshAllMessageButtons();
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            audio.onended  = () => { URL.revokeObjectURL(url); $b.removeClass('mm-bubble-playing'); };
+            audio.onerror  = () => { URL.revokeObjectURL(url); $b.removeClass('mm-bubble-playing'); };
+            await audio.play();
+        } catch(e) {
+            $b.removeClass('mm-bubble-loading mm-bubble-playing');
+            toastr.error('播放失败: ' + e.message);
+        }
+    });
 });
 
 
@@ -1303,7 +1645,7 @@ async function vcDrainTtsPipeline() {
 }
 
 // ── 独立 LLM 流式调用 ─────────────────────────────────────────────────────────
-function vcBuildLlmMessages(userText) {
+async function vcBuildLlmMessages(userText) {
     const set = vc(), ctx = getContext();
     const msgs = [];
     const blocks = (set.vcPromptBlocks || getDefaultVcBlocks()).filter(b => b.enabled);
@@ -1313,14 +1655,24 @@ function vcBuildLlmMessages(userText) {
             const desc = ctx.characters?.[ctx.characterId]?.description || '';
             if (desc) msgs.push({ role: 'system', content: desc });
         } else if (block.id === 'worldBook') {
-            const wi = [ctx.worldInfoBefore, ctx.worldInfoAfter].filter(Boolean).join('\n').trim();
-            if (wi) msgs.push({ role: 'system', content: wi });
+            const selectedKeys = block.selectedEntries;
+            if (selectedKeys?.length) {
+                // 按用户勾选的条目直接加载内容
+                const allEntries = await loadAllWbEntries();
+                const filtered = allEntries.filter(e => selectedKeys.includes(e.key));
+                const content = filtered.map(e => e.content).join('\n\n').trim();
+                if (content) msgs.push({ role: 'system', content });
+            } else {
+                // 未指定条目时回退到酒馆注入的合并字符串
+                const wi = [ctx.worldInfoBefore, ctx.worldInfoAfter].filter(Boolean).join('\n\n').trim();
+                if (wi) msgs.push({ role: 'system', content: wi });
+            }
         } else if (block.id === 'vcSystem') {
             if (set.vcSystemPrompt) msgs.push({ role: 'system', content: set.vcSystemPrompt });
         } else if (block.id === 'context') {
             const n = Math.max(0, Number(set.vcContextCount) || 10);
             const recent = (ctx.chat || []).filter(m => !m.is_system).slice(-n);
-            for (const m of recent) msgs.push({ role: m.is_user ? 'user' : 'assistant', content: m.mes });
+            for (const m of recent) msgs.push({ role: m.is_user ? 'user' : 'assistant', content: applyPreProcessRules(m.mes) });
         } else if (block.editable && block.content) {
             msgs.push({ role: 'system', content: block.content });
         }
@@ -1354,7 +1706,7 @@ async function vcStreamingLlm(userText) {
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...(key ? { 'Authorization': `Bearer ${key}` } : {}) },
-            body: JSON.stringify({ model, messages: vcBuildLlmMessages(userText), stream: true }),
+            body: JSON.stringify({ model, messages: await vcBuildLlmMessages(userText), stream: true }),
             signal: vcLlmAbortCtrl.signal,
         });
         if (!res.ok) throw new Error(`LLM API HTTP ${res.status}`);
@@ -1500,6 +1852,8 @@ async function vcInjectCallRecord(callLog) {
 
     // 刷新所有消息按钮，让注入消息上的 mes_quote_tts 显示 ready（绿色）
     refreshAllMessageButtons();
+    // 注入气泡：serverPath 已写入，气泡将直接显示为绿色（已缓存）
+    if (s().showBubbles) injectBubbles(newId);
 }
 
 // ── TTS (直接复用现有 MiniMax 端点) ──────────────────────────────────────────
