@@ -43,8 +43,9 @@
     display: flex; align-items: center; gap: 6px; height: 32px;
 }
 
-/* 按钮强制横排且不被挤压 */
-.menu_button {
+/* 按钮强制横排且不被挤压 — 只限插件自身面板 */
+.mm-config-dialog .menu_button,
+#minimax_quote_tts_editor .menu_button {
     white-space: nowrap !important;
     writing-mode: horizontal-tb !important;
     display: inline-flex !important;
@@ -537,10 +538,12 @@ body.vc-call-open {
     display: flex; gap: 6px; align-items: center;
     margin-bottom: 5px;
 }
-.mm-rule-row .mm-rule-toggle { flex: 0 0 20px; }
-.mm-rule-row .mm-rule-name   { flex: 1.2; min-width: 0; }
-.mm-rule-row .mm-rule-pattern { flex: 2; min-width: 0; font-family: monospace; font-size: 0.85rem; }
-.mm-rule-row .mm-rule-mode   { flex: 0 0 68px !important; width: 68px !important; }
+.mm-rule-toggle  { flex: 0 0 20px !important; width: 20px !important; }
+.mm-rule-name    { flex: 1.2; min-width: 0; }
+.mm-rule-pattern { flex: 2; min-width: 0; }
+.mm-rule-row .mm-rule-pattern { font-family: monospace; font-size: 0.85rem; }
+.mm-rule-mode    { flex: 0 0 68px !important; width: 68px !important; }
+.mm-rule-del     { flex: 0 0 32px !important; width: 32px !important; padding: 2px 0 !important; text-align: center; }
 
 /* ── Character Binding Rows ── */
 .mm-binding-row {
@@ -575,4 +578,77 @@ body.vc-call-open {
 .mm-del-block {
     margin-left: auto;
     flex-shrink: 0;
+}
+
+/* ── TTS 语音气泡 ── */
+
+/* 内联气泡：嵌入正文，圆形仅图标 */
+.mm-bubble {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    font-size: 0.62rem;
+    line-height: 1;
+    cursor: pointer;
+    background: rgba(128,128,128,0.12);
+    border: 1px solid rgba(128,128,128,0.22);
+    color: inherit;
+    opacity: 0.6;
+    transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+    vertical-align: middle;
+    margin: 0 2px;
+    flex-shrink: 0;
+    user-select: none;
+    white-space: nowrap;
+    overflow: hidden;
+}
+.mm-bubble:hover {
+    opacity: 1;
+    background: rgba(128,128,128,0.22);
+    border-color: rgba(128,128,128,0.4);
+}
+
+/* 底部条气泡：药丸形，带文字预览 */
+.mm-bubble-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(128,128,128,0.15);
+}
+.mm-bubble-strip .mm-bubble {
+    width: auto;
+    height: auto;
+    border-radius: 20px;
+    padding: 3px 9px;
+    font-size: 0.73rem;
+    max-width: 200px;
+    text-overflow: ellipsis;
+}
+
+.mm-bubble.mm-bubble-loading {
+    opacity: 0.35;
+    cursor: wait;
+}
+.mm-bubble.mm-bubble-playing {
+    background: rgba(70,145,255,0.2);
+    border-color: rgba(70,145,255,0.55);
+    color: #4691ff;
+    opacity: 1;
+}
+.mm-bubble.mm-bubble-cached {
+    background: rgba(76,175,136,0.15);
+    border-color: rgba(76,175,136,0.45);
+    color: #4caf88;
+    opacity: 0.85;
+}
+.mm-bubble.mm-bubble-cached:hover {
+    opacity: 1;
+    background: rgba(76,175,136,0.25);
+    border-color: rgba(76,175,136,0.65);
 }
