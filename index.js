@@ -4,7 +4,6 @@ import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 
 const MODULE_NAME = 'minimax_quote_tts';
 const PROXY_ENDPOINT = '/api/minimax/generate-voice';
-const LLM_PROXY = '/api/minimax/proxy';
 const DEFAULT_API_HOST = 'https://api.minimax.chat';
 const API_HOST_OPTIONS = [
     { value: 'https://api.minimax.chat',   label: '国内源 (api.minimax.chat)' },
@@ -223,13 +222,13 @@ async function syncToSTSecrets(apiKey, groupId) {
 }
 
 async function proxyFetch(url, options = {}) {
-    const res = await fetch(LLM_PROXY, {
-        method: 'POST', headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, method: options.method || 'GET', headers: options.headers || {}, body: options.body || null })
+    const res = await fetch(url, {
+        method: options.method || 'GET',
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        body: options.body != null ? JSON.stringify(options.body) : undefined,
     });
-    if (res.status === 404) throw new Error('接口 404，请确保重启后端！');
     const text = await res.text(); let data; try { data = JSON.parse(text); } catch (e) { data = text; }
-    if (!res.ok) throw new Error(data?.error || (typeof data === 'string' ? data : `HTTP ${res.status}`));
+    if (!res.ok) throw new Error(data?.error?.message || data?.error || (typeof data === 'string' ? data : `HTTP ${res.status}`));
     return data;
 }
 
