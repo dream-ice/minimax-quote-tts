@@ -22,7 +22,7 @@ const MODEL_OPTIONS = [
 const defaults = {
     enabled: true, autoPlay: true, showMessageButton: true, onlyCharacter: true,
     apiKey: '', groupId: '', apiHost: DEFAULT_API_HOST, model: 'speech-02-hd', voiceId: 'male-qn-qingse',
-    speed: 1, vol: 1, pitch: 0, emotion: '', audioFormat: 'mp3',
+    speed: 1, vol: 1, pitch: 0, emotion: '', audioFormat: 'mp3', ttsLanguage: '',
     maxQuotesPerMessage: 4, minLength: 1, maxLength: 300, ignoreCodeBlocks: true,
     characterBindingsMap: {}, llmPresets: [], formatterTemplates: [],
     formatterEnabled: false, formatterPresetIdx: -1,
@@ -246,6 +246,7 @@ async function getAudioBlob(item) {
             text: item.text, apiHost: set.apiHost, model: item.options.model, voiceId: item.options.voiceId,
             speed: item.options.speed, volume: item.options.vol, pitch: item.options.pitch,
             format: item.options.audioFormat, emotion: item.options.emotion,
+            language: item.options.language || undefined,
         }),
     });
     if (!res.ok) {
@@ -317,6 +318,7 @@ function buildSynthesisOptions(seg, m) {
         model: seg?.model || b?.model || set.model, voiceId: seg?.voiceId || b?.voiceId || set.voiceId,
         speed: Number(seg?.speed || set.speed), vol: Number(set.vol || 1.0), pitch: Number(set.pitch || 0),
         emotion: seg?.emotion || set.emotion || undefined, audioFormat: set.audioFormat || 'mp3',
+        language: set.ttsLanguage || undefined,
     };
 }
 
@@ -920,6 +922,22 @@ function openConfigPanel() {
         </div>
         <div class="mm-row"><label>语速</label><input id="mm_speed" class="text_pole" type="number" step="0.1" min="0.5" max="2" style="max-width:80px"></div>
         <div class="mm-row"><label>音量</label><input id="mm_vol" class="text_pole" type="number" step="0.1" min="0" max="10" style="max-width:80px"></div>
+        <div class="mm-row"><label>语言</label>
+          <select id="mm_tts_lang" class="text_pole">
+            <option value="">自动（Auto）</option>
+            <option value="zh">中文 (zh)</option>
+            <option value="en">English (en)</option>
+            <option value="ja">日本語 (ja)</option>
+            <option value="ko">한국어 (ko)</option>
+            <option value="fr">Français (fr)</option>
+            <option value="de">Deutsch (de)</option>
+            <option value="es">Español (es)</option>
+            <option value="pt">Português (pt)</option>
+            <option value="id">Indonesia (id)</option>
+            <option value="ar">العربية (ar)</option>
+          </select>
+          <span class="mm-inline-hint">克隆声音使用时建议明确指定语言</span>
+        </div>
         <div class="mm-row"><label>自动播放</label><input id="mm_autoplay" type="checkbox"></div>
         <div class="mm-row"><label>语音气泡</label><input id="mm_show_bubbles" type="checkbox"><span class="mm-inline-hint">在消息下方注入气泡，点击气泡单独收听该段语音</span></div>
         <div class="mm-row"><button id="mm_test_tts" class="menu_button"><i class="fa-solid fa-play"></i> 测试语音</button></div>
@@ -1083,7 +1101,7 @@ function openConfigPanel() {
     </div>
   </div>
 </div>`;
-        document.documentElement.insertAdjacentHTML('beforeend', panelHtml);
+        document.body.insertAdjacentHTML('beforeend', panelHtml);
 
         // ── Tab 切换 ──
         document.querySelectorAll('#mm-config-dialog .mm-tab').forEach(tab => {
@@ -1118,6 +1136,7 @@ function openConfigPanel() {
             s().voiceId = voiceSel.value || document.getElementById('mm_voice').value;
             s().speed   = Number(document.getElementById('mm_speed').value);
             s().vol     = Number(document.getElementById('mm_vol').value);
+            s().ttsLanguage = document.getElementById('mm_tts_lang').value;
             s().autoPlay = document.getElementById('mm_autoplay').checked;
             saveSettingsDebounced();
             // 同步凭证到 ST secrets，使原版 minimax.js 端点无需修改即可使用
@@ -1128,7 +1147,7 @@ function openConfigPanel() {
             saveSettingsDebounced();
             if (this.checked) refreshAllBubbles(); else removeAllBubbles();
         });
-        ['mm_key','mm_gid','mm_apihost','mm_model','mm_voice_sel','mm_voice','mm_speed','mm_vol','mm_autoplay'].forEach(id => {
+        ['mm_key','mm_gid','mm_apihost','mm_model','mm_voice_sel','mm_voice','mm_speed','mm_vol','mm_tts_lang','mm_autoplay'].forEach(id => {
             const el = document.getElementById(id);
             el.addEventListener('input', syncTts);
             el.addEventListener('change', syncTts);
@@ -1136,9 +1155,24 @@ function openConfigPanel() {
         document.getElementById('mm_voice_sel').addEventListener('change', function() {
             document.getElementById('mm_voice').style.display = this.value ? 'none' : '';
         });
+        const TEST_TEXTS = {
+            '':   '你好，我是MiniMax语音。',
+            'zh': '你好，我是MiniMax语音。',
+            'en': 'Hello, I am MiniMax voice.',
+            'ja': 'こんにちは、MiniMaxの音声です。',
+            'ko': '안녕하세요, 저는 MiniMax 음성입니다.',
+            'fr': 'Bonjour, je suis la voix MiniMax.',
+            'de': 'Hallo, ich bin die MiniMax-Stimme.',
+            'es': 'Hola, soy la voz MiniMax.',
+            'pt': 'Olá, sou a voz MiniMax.',
+            'id': 'Halo, saya adalah suara MiniMax.',
+            'ar': 'مرحبًا، أنا صوت MiniMax.',
+        };
         document.getElementById('mm_test_tts').addEventListener('click', async () => {
             try {
-                const item = { text: '你好，我是MiniMax语音。', options: buildSynthesisOptions(null, null), serverPath: null };
+                const lang = s().ttsLanguage || '';
+                const text = TEST_TEXTS[lang] || TEST_TEXTS[''];
+                const item = { text, options: buildSynthesisOptions(null, null), serverPath: null };
                 const blob = await getAudioBlob(item);
                 new Audio(URL.createObjectURL(blob)).play();
                 toastr.success('语音连通成功！');
@@ -1511,6 +1545,7 @@ function openConfigPanel() {
         document.getElementById('mm_model').value   = set.model   || 'speech-02-hd';
         document.getElementById('mm_speed').value   = set.speed   ?? 1;
         document.getElementById('mm_vol').value     = set.vol     ?? 1;
+        document.getElementById('mm_tts_lang').value       = set.ttsLanguage || '';
         document.getElementById('mm_autoplay').checked    = set.autoPlay !== false;
         document.getElementById('mm_show_bubbles').checked = set.showBubbles || false;
 
@@ -1525,10 +1560,11 @@ function openConfigPanel() {
         document.getElementById('mm_f_en').checked       = set.formatterEnabled || false;
         document.getElementById('mm_f_prompt').value     = set.formatterSystemPrompt || '';
         upFTemplates();
-        if (set.formatterPresetIdx >= 0) document.getElementById('mm_f_preset_sel').value = set.formatterPresetIdx;
 
+        // 必须先 refresh（填充 option）再赋值，否则 select 为空时赋值无效
         refreshAllLlmPresetSelects();
         if ((s().llmPresets || []).length > 0) { document.getElementById('mm_llm_presets').value = 0; loadLlmPresetFields(0); }
+        if (set.formatterPresetIdx >= 0) document.getElementById('mm_f_preset_sel').value = set.formatterPresetIdx;
 
         document.getElementById('mm_vc_enabled').checked = set.vcEnabled !== false;
         document.getElementById('mm_vc_inject').checked  = set.vcInjectOnEnd !== false;
