@@ -36,6 +36,12 @@ const defaults = {
     vcPromptTemplates: [],     // [{name, blocks:[...], systemPrompt:''}]
     llmPreProcessRules: [],    // [{id, enabled, name, pattern, mode}] 发送前预处理（剔除think等）
     showBubbles: false,        // 在消息下方注入可点击语音气泡
+    vrmEnabled: false,         // 是否启用视频通话功能（显示视频悬浮球）
+    vrmModelUrl: '',           // VRM 模型 URL（支持 http/blob/file）
+    vrmFilename: '',           // 上传的 VRM 文件名（显示用）
+    vrmBg: 'transparent',      // VRM 帧背景：transparent | dark | light
+    vrmLlmPresetIdx: -1,       // 视频通话专用 LLM 预设索引
+    vrmPixelRatio: 1,          // 渲染像素比（0.5~3；手机建议 1，PC 建议 1.5~2）
 };
 
 let playbackQueue = [], isPlaying = false, clickTimer = null;
@@ -150,6 +156,11 @@ function loadSettings() {
         if (afterIdx >= 0) settings.vcPromptBlocks.splice(afterIdx + 1, 0, worldBookBlock);
         else settings.vcPromptBlocks.unshift(worldBookBlock);
     }
+    // 迁移：为已存储的 vcPromptBlocks 补充缺失的 vrmActions 块
+    if (Array.isArray(settings.vcPromptBlocks) && !settings.vcPromptBlocks.some(b => b.id === 'vrmActions')) {
+        const vrmActionsBlock = { id: 'vrmActions', enabled: false, label: 'VRM表情/动作', editable: false, hint: '（视频通话时让 AI 输出表情动作标签，语音通话无效）' };
+        settings.vcPromptBlocks.push(vrmActionsBlock);
+    }
     // 清理旧字段
     delete settings.quoteOnly;
     delete settings.regexMode;
@@ -196,6 +207,21 @@ async function getAudioFromSTServer(path) {
     try { const res = await fetch(path, { headers: getRequestHeaders() }); return res.ok ? await res.blob() : null; } catch (e) { return null; }
 }
 
+/**
+ * 把 MiniMax API 凭证同步写入 ST 的 secrets 系统。
+ * 这样插件无需修改 src/endpoints/minimax.js —— 原版端点直接从 secrets 读取。
+ */
+async function syncToSTSecrets(apiKey, groupId) {
+    try {
+        const writes = [];
+        if (apiKey)  writes.push(fetch('/api/secrets/write', { method: 'POST', headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'api_key_minimax',   value: apiKey  }) }));
+        if (groupId) writes.push(fetch('/api/secrets/write', { method: 'POST', headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'minimax_group_id', value: groupId }) }));
+        await Promise.all(writes);
+    } catch (e) {
+        console.warn('[MiniMax] secrets 同步失败（不影响功能）:', e.message);
+    }
+}
+
 async function proxyFetch(url, options = {}) {
     const res = await fetch(LLM_PROXY, {
         method: 'POST', headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
@@ -221,7 +247,6 @@ async function getAudioBlob(item) {
             text: item.text, apiHost: set.apiHost, model: item.options.model, voiceId: item.options.voiceId,
             speed: item.options.speed, volume: item.options.vol, pitch: item.options.pitch,
             format: item.options.audioFormat, emotion: item.options.emotion,
-            apiKey: (set.apiKey || '').trim(), groupId: (set.groupId || '').trim(),
         }),
     });
     if (!res.ok) {
@@ -608,6 +633,8 @@ function createUi() {
     });
 
     loadSettings();
+    // 启动时把已保存的凭证同步到 ST secrets（让原版端点无需修改即可使用）
+    syncToSTSecrets((s().apiKey || '').trim(), (s().groupId || '').trim());
     refreshAllLlmPresetSelects();
     eventSource.on(event_types.CHARACTER_SELECTED, () => { if (document.getElementById('mm_b_rows')) renderBindings(); });
     eventSource.on(event_types.CHAT_CHANGED, () => { if (document.getElementById('mm_b_rows')) renderBindings(); });
@@ -617,10 +644,11 @@ function createUi() {
 
 function getDefaultVcBlocks() {
     return [
-        { id: 'charDesc',  enabled: true,  label: '角色卡描述',     editable: false, hint: '（自动读取当前角色卡描述）' },
-        { id: 'worldBook', enabled: false, label: '世界书',         editable: false, hint: '（世界书注入内容，内容多时注意 token 消耗）' },
-        { id: 'context',   enabled: true,  label: '上下文对话',     editable: false, hint: '（酒馆聊天记录，见下方条数设置）' },
+        { id: 'charDesc',     enabled: true,  label: '角色卡描述',  editable: false, hint: '（自动读取当前角色卡描述）' },
+        { id: 'worldBook',    enabled: false, label: '世界书',      editable: false, hint: '（世界书注入内容，内容多时注意 token 消耗）' },
+        { id: 'context',      enabled: true,  label: '上下文对话',  editable: false, hint: '（酒馆聊天记录，见下方条数设置）' },
         { id: 'vcSystem',  enabled: true,  label: '通话系统提示词', editable: true  },
+        { id: 'vrmActions', enabled: false, label: 'VRM表情/动作', editable: false, hint: '（视频通话时让 AI 输出表情动作标签，语音通话无效）' },
     ];
 }
 
@@ -714,7 +742,7 @@ function renderVcBlocks() {
     const container = document.getElementById('mm_vc_blocks');
     if (!container) return;
     container.innerHTML = '';
-    const BUILTIN_IDS = new Set(['charDesc', 'worldBook', 'context', 'vcSystem']);
+    const BUILTIN_IDS = new Set(['charDesc', 'worldBook', 'context', 'vcSystem', 'vrmActions']);
     blocks.forEach((block, i) => {
         const el = document.createElement('div');
         el.className = 'mm-block mm-draggable';
@@ -873,6 +901,7 @@ function openConfigPanel() {
         <button class="mm-tab" data-tab="llm">LLM预设</button>
         <button class="mm-tab" data-tab="format">格式化</button>
         <button class="mm-tab" data-tab="vc">语音通话</button>
+        <button class="mm-tab" data-tab="vrm">视频通话</button>
       </div>
       <button class="mm-config-close" title="关闭">✕</button>
     </div>
@@ -1002,6 +1031,56 @@ function openConfigPanel() {
         </div>
       </div>
 
+      <!-- Tab: 视频通话 -->
+      <div class="mm-tab-panel" data-panel="vrm">
+        <p class="mm-desc">通话时渲染 VRM 3D 角色，占据屏幕上半部分（类视觉小说布局），支持实时口型同步与情感表情驱动。</p>
+
+        <div class="mm-section-title">基本设置</div>
+        <div class="mm-row">
+          <label>启用视频通话</label>
+          <input id="mm_vrm_enabled" type="checkbox">
+          <span class="mm-inline-hint">启用后出现视频悬浮球</span>
+        </div>
+        <div class="mm-row">
+          <label>LLM 预设</label>
+          <select id="mm_vrm_llm_preset" class="text_pole llm-preset-sel"></select>
+        </div>
+
+        <div class="mm-section-title" style="margin-top:14px">VRM 模型</div>
+        <div class="mm-row">
+          <label>模型 URL</label>
+          <input id="mm_vrm_url" class="text_pole" type="text" placeholder="https://... 或留空使用下方上传">
+        </div>
+        <div class="mm-row">
+          <label>上传模型</label>
+          <button id="mm_vrm_upload" class="menu_button"><i class="fa-solid fa-upload"></i> 选择 .vrm 文件</button>
+          <span id="mm_vrm_filename" class="mm-inline-hint"></span>
+        </div>
+        <div class="mm-row" style="flex-wrap:wrap;gap:8px">
+          <button id="mm_vrm_preview" class="menu_button"><i class="fa-solid fa-eye"></i> 预览模型</button>
+          <button id="mm_vrm_stop_preview" class="menu_button" style="display:none"><i class="fa-solid fa-stop"></i> 停止预览</button>
+        </div>
+        <div id="mm_vrm_preview_wrap" style="display:none;margin-top:10px;width:100%;text-align:center">
+          <canvas id="mm_vrm_preview_canvas" width="320" height="420" style="border-radius:12px;max-width:100%;display:inline-block"></canvas>
+        </div>
+
+        <div class="mm-section-title" style="margin-top:14px">画面设置</div>
+        <div class="mm-row">
+          <label>背景色</label>
+          <select id="mm_vrm_bg" class="text_pole">
+            <option value="transparent">透明（显示酒馆背景）</option>
+            <option value="dark">深色</option>
+            <option value="light">浅色</option>
+          </select>
+        </div>
+        <div class="mm-row" style="align-items:center">
+          <label>渲染质量</label>
+          <input id="mm_vrm_dpr" type="range" min="0.5" max="3" step="0.5" style="flex:1;margin:0 8px">
+          <span id="mm_vrm_dpr_val" class="mm-inline-hint" style="min-width:28px;text-align:right">1×</span>
+        </div>
+        <p class="mm-desc" style="margin-top:2px">手机建议 1×，PC 建议 1.5~2×。过高会导致手机内存不足自动刷新页面。</p>
+      </div>
+
     </div>
   </div>
 </div>`;
@@ -1018,6 +1097,7 @@ function openConfigPanel() {
                 if (t === 'vc')     { renderVcBlocks(); }
                 if (t === 'tts')    { renderVoiceLibrary(); refreshVoiceSelects(); renderBindings(); }
                 if (t === 'format') { renderRules(); renderRegexPresets(); renderPreProcessRules(); }
+                if (t === 'vrm')    { syncVrmFields(); }
             });
         });
 
@@ -1041,6 +1121,8 @@ function openConfigPanel() {
             s().vol     = Number(document.getElementById('mm_vol').value);
             s().autoPlay = document.getElementById('mm_autoplay').checked;
             saveSettingsDebounced();
+            // 同步凭证到 ST secrets，使原版 minimax.js 端点无需修改即可使用
+            syncToSTSecrets((s().apiKey || '').trim(), (s().groupId || '').trim());
         };
         document.getElementById('mm_show_bubbles').addEventListener('change', function() {
             s().showBubbles = this.checked;
@@ -1280,6 +1362,100 @@ function openConfigPanel() {
             el.addEventListener('change', syncVc);
         });
 
+        // ── 视频通话 (VRM) ──
+        function syncVrmFields() {
+            document.getElementById('mm_vrm_enabled').checked = !!s().vrmEnabled;
+            let url = s().vrmModelUrl || '';
+            // 修复旧版本可能存储的双斜杠路径（如 //user/files/model.vrm）
+            if (url.startsWith('//')) { url = url.slice(1); s().vrmModelUrl = url; saveSettingsDebounced(); }
+            // blob URL（旧版本）或服务器路径（新版本）均视为"已上传"，只显示文件名
+            const isUpload = url.startsWith('blob:') || url.startsWith('/user/files/') || url.startsWith('user/files/');
+            document.getElementById('mm_vrm_url').value = isUpload ? '' : url;
+            document.getElementById('mm_vrm_filename').textContent = isUpload ? (s().vrmFilename || '（已上传）') : '';
+            document.getElementById('mm_vrm_bg').value = s().vrmBg || 'transparent';
+            const dpr = s().vrmPixelRatio ?? 1;
+            const dprEl = document.getElementById('mm_vrm_dpr');
+            if (dprEl) { dprEl.value = dpr; document.getElementById('mm_vrm_dpr_val').textContent = dpr + '×'; }
+            refreshAllLlmPresetSelects();
+            if (s().vrmLlmPresetIdx >= 0) document.getElementById('mm_vrm_llm_preset').value = s().vrmLlmPresetIdx;
+        }
+        document.getElementById('mm_vrm_enabled').addEventListener('change', function() {
+            s().vrmEnabled = this.checked; saveSettingsDebounced();
+            const vrmFab = document.getElementById('vrm-fab');
+            if (vrmFab) vrmFab.style.display = this.checked ? '' : 'none';
+        });
+        document.getElementById('mm_vrm_llm_preset').addEventListener('change', function() {
+            s().vrmLlmPresetIdx = Number(this.value); saveSettingsDebounced();
+        });
+        document.getElementById('mm_vrm_url').addEventListener('input', function() {
+            s().vrmModelUrl = this.value.trim(); saveSettingsDebounced();
+        });
+        document.getElementById('mm_vrm_bg').addEventListener('change', function() {
+            s().vrmBg = this.value; saveSettingsDebounced();
+            applyVrmBg();
+        });
+        document.getElementById('mm_vrm_dpr').addEventListener('input', function() {
+            const dpr = Number(this.value);
+            s().vrmPixelRatio = dpr; saveSettingsDebounced();
+            document.getElementById('mm_vrm_dpr_val').textContent = dpr + '×';
+            if (vrmModule?.isReady()) vrmModule.setPixelRatio(dpr);
+        });
+        document.getElementById('mm_vrm_upload').addEventListener('click', () => {
+            const inp = document.createElement('input');
+            inp.type = 'file'; inp.accept = '.vrm';
+            inp.onchange = async () => {
+                const file = inp.files?.[0]; if (!file) return;
+                const btn = document.getElementById('mm_vrm_upload');
+                const origHtml = btn.innerHTML;
+                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 上传中...';
+                btn.disabled = true;
+                try {
+                    // 上传到酒馆服务器（所有设备均可访问）
+                    const serverPath = await vrmServerUpload(file);
+                    s().vrmModelUrl = serverPath;
+                    s().vrmFilename = file.name;
+                    saveSettingsDebounced();
+                    document.getElementById('mm_vrm_url').value = '';
+                    document.getElementById('mm_vrm_filename').textContent = file.name;
+                    toastr.success('VRM 已上传到服务器');
+                    document.getElementById('mm_vrm_preview').click();
+                } catch (e) {
+                    toastr.error('VRM 上传失败: ' + e.message);
+                } finally {
+                    btn.innerHTML = origHtml;
+                    btn.disabled = false;
+                }
+            };
+            inp.click();
+        });
+        document.getElementById('mm_vrm_preview').addEventListener('click', async () => {
+            const url = s().vrmModelUrl?.trim();
+            if (!url) { toastr.warning('请先填写模型 URL 或上传 .vrm 文件'); return; }
+            const wrap = document.getElementById('mm_vrm_preview_wrap');
+            wrap.style.display = '';
+            document.getElementById('mm_vrm_stop_preview').style.display = '';
+            const canvas = document.getElementById('mm_vrm_preview_canvas');
+            try {
+                console.log('[VRM] 预览加载 URL:', url);
+                if (!vrmModule) vrmModule = await import('./vrm.js');
+                await vrmModule.init(canvas, s().vrmPixelRatio ?? 1);
+                await vrmModule.loadModel(url);
+                vrmModule.setState('idle');
+                toastr.success('VRM 模型加载成功');
+            } catch (e) {
+                console.error('[VRM] 加载失败:', e, 'URL:', url);
+                const hint = e.message?.includes('超时') ? '（提示：手机端需要能访问 esm.sh CDN，国内可能需要代理）' : '';
+                toastr.error('VRM 加载失败: ' + e.message + hint, '', { timeOut: 8000 });
+                wrap.style.display = 'none';
+                document.getElementById('mm_vrm_stop_preview').style.display = 'none';
+            }
+        });
+        document.getElementById('mm_vrm_stop_preview').addEventListener('click', () => {
+            if (vrmModule) { try { vrmModule.destroy(); } catch (_) {} }
+            document.getElementById('mm_vrm_preview_wrap').style.display = 'none';
+            document.getElementById('mm_vrm_stop_preview').style.display = 'none';
+        });
+
         // VC 提示词模板
         const vcTplSel = document.getElementById('mm_vc_templates');
         const upVcTemplates = () => {
@@ -1359,6 +1535,7 @@ function openConfigPanel() {
         document.getElementById('mm_vc_inject').checked  = set.vcInjectOnEnd !== false;
         if (set.vcLlmPresetIdx >= 0) document.getElementById('mm_vc_llm_preset').value = set.vcLlmPresetIdx;
         document.getElementById('mm_vc_ctx_count').value = set.vcContextCount || 10;
+        // VRM 初始值在切换到 vrm tab 时通过 syncVrmFields() 填充
         upVcTemplates();
 
         renderRules(); renderRegexPresets(); renderPreProcessRules();
@@ -1462,8 +1639,20 @@ const VC_DEFAULTS = {
 };
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let vcActive = false;  // true when a call is in progress (suppresses regular auto-play)
-let vcState  = 'idle'; // idle | connecting | listening | recording | processing | thinking | speaking
+let vcActive   = false;   // true when a call is in progress (suppresses regular auto-play)
+let vcState    = 'idle';  // idle | connecting | listening | recording | processing | thinking | speaking
+let callMode   = 'voice'; // 'voice' | 'video' — set before vcStartCall(), determines FAB + VRM
+
+// 视频通话时把 vc-dialog 的 UI ID 重定向到 VRM HUD / info bar 里的对应元素
+const VRM_HUD_MAP = { 'vc-status':'vrm-info-status', 'vc-log':'vrm-log', 'vc-name':'vrm-info-name', 'vc-timer':'vrm-info-timer', 'vc-mute':'vrm-mute', 'vc-canvas': null };
+function vcEl(id) {
+    if (callMode === 'video') {
+        const mapped = VRM_HUD_MAP[id];
+        if (mapped === null) return null;          // 无此元素（如波形画布）
+        if (mapped !== undefined) return document.getElementById(mapped);
+    }
+    return document.getElementById(id);
+}
 
 let vcAudioCtx    = null;
 let vcPlaybackCtx = null; // 专用于 TTS 播放的 AudioContext（iOS 解锁后可异步播放）
@@ -1482,6 +1671,119 @@ let vcGenDone       = true;  // LLM 生成是否已结束
 let vcCallLog       = [];    // [{role, content, audioItems?}] 本次通话记录
 let vcLlmAbortCtrl  = null;  // AbortController，用于中断流式 LLM
 let vcCurrentResponseAudioItems = null; // 当前 AI 回复对应的 TTS 条目（用于挂断后存档）
+
+// ── VRM ───────────────────────────────────────────────────────────────────────
+let vrmModule      = null; // 动态 import('./vrm.js') 的模块对象
+let vrmAnalyserNode = null; // AnalyserNode，接在 vcPlaybackCtx 上，驱动口型
+
+function applyVrmBg() {
+    const frame = document.getElementById('mm-vrm-frame');
+    if (!frame) return;
+    const bg = s().vrmBg || 'transparent';
+    const map = { transparent: 'transparent', dark: '#09111f', light: '#f0eff5' };
+    frame.style.background = map[bg] ?? 'transparent';
+}
+
+// ── VRM 文件 IndexedDB 持久化 ──────────────────────────────────────────────────
+const VRM_DB_NAME  = 'mm-vrm-db';
+const VRM_DB_STORE = 'files';
+const VRM_DB_KEY   = 'vrm-model';
+
+function vrmOpenDb() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(VRM_DB_NAME, 1);
+        req.onupgradeneeded = e => e.target.result.createObjectStore(VRM_DB_STORE);
+        req.onsuccess = e => resolve(e.target.result);
+        req.onerror   = e => reject(e.target.error);
+    });
+}
+
+async function vrmDbSave(file) {
+    try {
+        const db = await vrmOpenDb();
+        await new Promise((resolve, reject) => {
+            const tx  = db.transaction(VRM_DB_STORE, 'readwrite');
+            const req = tx.objectStore(VRM_DB_STORE).put(file, VRM_DB_KEY);
+            req.onsuccess = resolve; req.onerror = e => reject(e.target.error);
+        });
+        db.close();
+    } catch (e) { console.warn('[VRM] IndexedDB save failed', e); }
+}
+
+async function vrmDbLoad() {
+    try {
+        const db = await vrmOpenDb();
+        const file = await new Promise((resolve, reject) => {
+            const tx  = db.transaction(VRM_DB_STORE, 'readonly');
+            const req = tx.objectStore(VRM_DB_STORE).get(VRM_DB_KEY);
+            req.onsuccess = e => resolve(e.target.result);
+            req.onerror   = e => reject(e.target.error);
+        });
+        db.close();
+        return file || null;
+    } catch (e) { console.warn('[VRM] IndexedDB load failed', e); return null; }
+}
+
+/**
+ * 将 File 对象上传到酒馆服务器（/api/files/upload）。
+ * 返回可供所有设备访问的服务器路径，如 '/user/files/model.vrm'。
+ */
+async function vrmServerUpload(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = async () => {
+            try {
+                const base64   = reader.result.split(',')[1];
+                // 文件名只保留安全字符（ST 服务器要求）
+                const safeName = file.name.replace(/[^a-zA-Z0-9_\-.]/g, '_');
+                const res = await fetch('/api/files/upload', {
+                    method: 'POST',
+                    headers: getRequestHeaders(),
+                    body: JSON.stringify({ name: safeName, data: base64 }),
+                });
+                if (!res.ok) {
+                    const msg = await res.text();
+                    reject(new Error(msg || res.statusText));
+                    return;
+                }
+                const json = await res.json();
+                // clientRelativePath already returns a path starting with '/', avoid double-slash
+                const serverPath = json.path.startsWith('/') ? json.path : '/' + json.path;
+                resolve(serverPath); // e.g. '/user/files/model.vrm'
+            } catch (e) { reject(e); }
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+}
+
+/**
+ * 页面加载时调用：若存储的 URL 是旧版 blob（跨会话失效），尝试从 IDB 读取
+ * 文件并迁移到服务器，使手机等多设备也能访问。
+ */
+async function restoreVrmBlobUrl() {
+    const stored = s().vrmModelUrl || '';
+    if (!stored || !stored.startsWith('blob:')) return;
+    const file = await vrmDbLoad();
+    if (file) {
+        try {
+            // 自动迁移：上传到服务器，替换 blob URL
+            const serverPath = await vrmServerUpload(file);
+            s().vrmModelUrl  = serverPath;
+            saveSettingsDebounced();
+            console.info('[VRM] 已自动迁移至服务器:', serverPath);
+        } catch {
+            // 迁移失败（网络问题等），本次会话仍使用 blob URL
+            s().vrmModelUrl = URL.createObjectURL(file);
+        }
+    } else {
+        // IDB 无文件（其他浏览器/设备），清除失效 blob URL
+        console.warn('[VRM] 检测到跨设备访问：手机端 IDB 无模型文件，已清除 blob URL。',
+            '文件名:', s().vrmFilename, '→ 请在 PC 端设置中重新上传 VRM 以生成服务器 URL。');
+        s().vrmModelUrl = '';
+        saveSettingsDebounced();
+    }
+}
 
 // ── Settings helpers ──────────────────────────────────────────────────────────
 function vcLoadSettings() {
@@ -1510,15 +1812,34 @@ function vcSetState(state) {
         speaking: 'AI 说话中...',
     };
 
-    const fab = document.getElementById('vc-fab');
-    if (fab) {
-        fab.querySelector('i').className = `fa-solid ${icons[state] || 'fa-phone'}`;
-        fab.classList.toggle('vc-fab-active', state !== 'idle');
+    const fab    = document.getElementById('vc-fab');
+    const vrmFab = document.getElementById('vrm-fab');
+    if (state === 'idle') {
+        // 通话结束：两个 FAB 都恢复默认
+        if (fab)    { fab.querySelector('i').className = 'fa-solid fa-phone';  fab.classList.remove('vc-fab-active'); fab.style.opacity = ''; fab.style.pointerEvents = ''; }
+        if (vrmFab) { vrmFab.querySelector('i').className = 'fa-solid fa-video'; vrmFab.classList.remove('vc-fab-active'); vrmFab.style.opacity = ''; vrmFab.style.pointerEvents = ''; }
+    } else if (callMode === 'voice') {
+        if (fab)    { fab.querySelector('i').className = `fa-solid ${icons[state] || 'fa-phone'}`; fab.classList.add('vc-fab-active'); fab.style.opacity = ''; fab.style.pointerEvents = ''; }
+        if (vrmFab) { vrmFab.style.opacity = '0.35'; vrmFab.style.pointerEvents = 'none'; }
+    } else { // callMode === 'video'
+        if (vrmFab) { vrmFab.querySelector('i').className = `fa-solid ${icons[state] || 'fa-video'}`; vrmFab.classList.add('vc-fab-active'); vrmFab.style.opacity = ''; vrmFab.style.pointerEvents = ''; }
+        if (fab)    { fab.style.opacity = '0.35'; fab.style.pointerEvents = 'none'; }
     }
-    const statusEl = document.getElementById('vc-status');
+    const statusEl = vcEl('vc-status');
     if (statusEl) statusEl.textContent = (vcMuted && state === 'listening') ? '已静音' : (labels[state] ?? '');
     const dialog = document.getElementById('vc-dialog');
     if (dialog) dialog.dataset.state = state;
+
+    // VRM 状态映射
+    if (vrmModule?.isReady()) {
+        const VRM_STATE_MAP = {
+            idle: 'idle', connecting: 'idle',
+            listening: 'listening', recording: 'listening',
+            processing: 'thinking', thinking: 'thinking',
+            speaking: 'speaking',
+        };
+        vrmModule.setState(VRM_STATE_MAP[state] || 'idle');
+    }
 }
 
 // ── 句子提取 ──────────────────────────────────────────────────────────────────
@@ -1614,7 +1935,12 @@ async function vcDrainTtsPipeline() {
                 const audioBuffer = await vcPlaybackCtx.decodeAudioData(arrayBuffer);
                 const source = vcPlaybackCtx.createBufferSource();
                 source.buffer = audioBuffer;
-                source.connect(vcPlaybackCtx.destination);
+                if (vrmAnalyserNode) {
+                    source.connect(vrmAnalyserNode);
+                    vrmAnalyserNode.connect(vcPlaybackCtx.destination);
+                } else {
+                    source.connect(vcPlaybackCtx.destination);
+                }
                 vcSpeakAudio = source;
                 await new Promise(resolve => {
                     source.onended = () => { vcSpeakAudio = null; resolve(); };
@@ -1669,6 +1995,8 @@ async function vcBuildLlmMessages(userText) {
             }
         } else if (block.id === 'vcSystem') {
             if (set.vcSystemPrompt) msgs.push({ role: 'system', content: set.vcSystemPrompt });
+        } else if (block.id === 'vrmActions') {
+            msgs.push({ role: 'system', content: `【表情动作标签】回复中可用以下标签自然表达情绪和动作，系统会自动处理，请勿读出标签文字：\n表情：[e:happy]开心 [e:sad]悲伤 [e:angry]愤怒 [e:surprised]惊讶 [e:relaxed]放松\n动作：[a:nod]点头 [a:shake]摇头 [a:wave]招手 [a:tilt]歪头\n示例："你来了！[e:happy][a:wave] 好久不见。"` });
         } else if (block.id === 'context') {
             const n = Math.max(0, Number(set.vcContextCount) || 10);
             const recent = (ctx.chat || []).filter(m => !m.is_system).slice(-n);
@@ -1683,9 +2011,27 @@ async function vcBuildLlmMessages(userText) {
     return msgs;
 }
 
+// ── VRM 标签解析 ───────────────────────────────────────────────────────────────
+// 标签格式：[e:name] 表情  [a:name] 动作
+// 只在 callMode=video 且 vrmModule 就绪时派发；始终从文本中剥离标签
+const VRM_TAG_RE = /\[(e|a):(\w+)\]/g;
+function stripAndDispatchVrmTags(text) {
+    let dispatched = 0;
+    const stripped = text.replace(VRM_TAG_RE, (_, type, name) => {
+        if (callMode === 'video' && vrmModule?.isReady()) {
+            if (type === 'e') vrmModule.setEmotion(name);
+            else if (type === 'a') vrmModule.playAction(name);
+            dispatched++;
+        }
+        return '';
+    });
+    return { stripped, dispatched };
+}
+
 async function vcStreamingLlm(userText) {
-    const preset = (s().llmPresets || [])[s().vcLlmPresetIdx];
-    if (!preset || !preset.url || !preset.model) { toastr.error('请先在语音通话设置里选择一个 LLM 预设'); vcSetState('listening'); vcResumeListening(); return; }
+    const presetIdx = (callMode === 'video' && s().vrmLlmPresetIdx >= 0) ? s().vrmLlmPresetIdx : s().vcLlmPresetIdx;
+    const preset = (s().llmPresets || [])[presetIdx];
+    if (!preset || !preset.url || !preset.model) { toastr.error('请先在设置里选择 LLM 预设'); vcSetState('listening'); vcResumeListening(); return; }
     const url   = normalizeOaiUrl(preset.url);
     const key   = (preset.key || '').trim();
     const model = (preset.model || '').trim();
@@ -1716,9 +2062,10 @@ async function vcStreamingLlm(userText) {
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let sseBuf = '', fullText = '';
+        let vrmTagCount = 0; // 本轮派发的 VRM 标签数量
 
         // 流式更新通话记录：第一个 token 到达时创建元素，后续逐字追加
-        const logContainer = document.getElementById('vc-log');
+        const logContainer = vcEl('vc-log');
         let liveLogEl = null;
 
         try {
@@ -1739,6 +2086,11 @@ async function vcStreamingLlm(userText) {
                         fullText += delta;
                         vcStreamBuffer += delta;
 
+                        // 剥离 VRM 标签（同时派发给 VRM 模块）
+                        const { stripped, dispatched } = stripAndDispatchVrmTags(vcStreamBuffer);
+                        vcStreamBuffer = stripped;
+                        vrmTagCount += dispatched;
+
                         // 逐字更新 vcLog（让用户看到字在流式出现，而不是等全文才显示）
                         if (logContainer) {
                             if (!liveLogEl) {
@@ -1747,7 +2099,7 @@ async function vcStreamingLlm(userText) {
                                 liveLogEl.textContent = 'TA: ';
                                 logContainer.appendChild(liveLogEl);
                             }
-                            liveLogEl.textContent = 'TA: ' + fullText.replace(/\*[^*]*\*/g, '').replace(/\n+/g, ' ');
+                            liveLogEl.textContent = 'TA: ' + fullText.replace(/\*[^*]*\*/g, '').replace(VRM_TAG_RE, '').replace(/\n+/g, ' ');
                             logContainer.scrollTop = logContainer.scrollHeight;
                         }
 
@@ -1778,6 +2130,8 @@ async function vcStreamingLlm(userText) {
 
         // 记录到通话日志（liveLogEl 已经显示了流式文字，这里只更新数据）
         if (vcActive && fullText) {
+            // 无标签时才做整体关键词情感分析（有标签则已精准派发过）
+            if (vrmModule?.isReady() && vrmTagCount === 0) vrmModule.setEmotionFromText(fullText);
             vcCallLog.push({ role: 'user', content: userText });
             // audioItems 携带本轮所有 TTS 条目（含 blob promise），挂断时用于存档
             vcCallLog.push({ role: 'assistant', content: fullText, audioItems: vcCurrentResponseAudioItems || [] });
@@ -1881,8 +2235,6 @@ async function vcTtsSpeak(text) {
             pitch:    Number(set.pitch),
             format:   'mp3',
             emotion:  set.emotion || '',
-            apiKey:   (set.apiKey  || '').trim(),
-            groupId:  (set.groupId || '').trim(),
         }),
     });
     if (!res.ok) throw new Error(`TTS HTTP ${res.status}`);
@@ -1892,7 +2244,7 @@ async function vcTtsSpeak(text) {
 
 // ── 对话记录 ──────────────────────────────────────────────────────────────────
 function vcLog(speaker, text) {
-    const log = document.getElementById('vc-log');
+    const log = vcEl('vc-log');
     if (!log) return;
     const el = document.createElement('div');
     el.className = `vc-log-line vc-log-${speaker}`;
@@ -1925,7 +2277,7 @@ function vcStartWebSpeech() {
     vcSpeechRec.maxAlternatives = 1;
 
     // vcLog 里的实时文字元素（interim 时透明度低，final 后正常）
-    const logEl = document.getElementById('vc-log');
+    const logEl = vcEl('vc-log');
     let liveEl = null;
 
     const removeLive = () => {
@@ -1988,7 +2340,7 @@ function vcStartWebSpeech() {
 function vcStartWaveform() {
     const loop = () => {
         if (!vcActive) return;
-        const canvas = document.getElementById('vc-canvas');
+        const canvas = vcEl('vc-canvas');
         if (!canvas) { requestAnimationFrame(loop); return; }
         const ctx2d = canvas.getContext('2d');
         const W = canvas.width, H = canvas.height;
@@ -2033,12 +2385,60 @@ function vcStartWaveform() {
 // ── 通话生命周期 ──────────────────────────────────────────────────────────────
 async function vcStartCall() {
     vcLoadSettings();
-    if (!vc().vcEnabled) return;
+    if (callMode === 'voice' && !vc().vcEnabled) return;
+    if (callMode === 'video' && !s().vrmEnabled)  return;
 
     // 在用户手势的同步调用栈中创建 AudioContext，使其处于"解锁"状态。
     // iOS Safari 要求 AudioContext 必须由用户手势创建，之后才能在异步代码中播放音频。
     if (vcPlaybackCtx) { try { vcPlaybackCtx.close(); } catch (_) {} }
     vcPlaybackCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // VRM：视频通话时（callMode === 'video'）始终启动，语音通话时不启动
+    vrmAnalyserNode = null;
+    if (callMode === 'video') {
+        try {
+            vrmAnalyserNode = vcPlaybackCtx.createAnalyser();
+            vrmAnalyserNode.fftSize = 256;
+        } catch (_) {}
+        // 展开 VN 式布局：上方 60vh 给 VRM，下方 40vh 给聊天
+        document.documentElement.classList.add('mm-vc-active');
+        applyVrmBg();
+        // 异步加载 VRM 模块并初始化画布（不阻塞通话启动）
+        (async () => {
+            try {
+                if (!vrmModule) vrmModule = await import('./vrm.js');
+                const canvas = document.getElementById('vc-vrm-canvas');
+                const frame  = document.getElementById('mm-vrm-frame');
+                console.log('[VRM] frame:', frame?.clientWidth, 'x', frame?.clientHeight,
+                    'display:', frame ? getComputedStyle(frame).display : 'N/A',
+                    '| canvas:', canvas?.clientWidth, 'x', canvas?.clientHeight,
+                    '| modelUrl:', s().vrmModelUrl);
+                if (canvas) {
+                    await vrmModule.init(canvas, s().vrmPixelRatio ?? 1);
+                    const modelUrl = s().vrmModelUrl?.trim();
+                    if (modelUrl) {
+                        await vrmModule.loadModel(modelUrl);
+                    } else {
+                        // 最常见原因：手机端IDB没有模型，blob URL被清空
+                        // 用户需在PC端重新上传VRM，使服务器URL写入设置
+                        toastr.warning(
+                            'VRM 模型未找到。\n请在 PC 端「视频通话」设置中重新点击上传按钮，' +
+                            '将模型保存到服务器后手机即可访问。',
+                            'VRM 未加载', { timeOut: 10000 }
+                        );
+                        console.warn('[VRM] vrmModelUrl 为空，可能是手机端 IDB 无文件导致 blob URL 被清除。当前值:', s().vrmModelUrl, '文件名:', s().vrmFilename);
+                    }
+                    if (vrmAnalyserNode) vrmModule.setAnalyser(vrmAnalyserNode);
+                    vrmModule.resize(canvas);
+                    vrmModule.setState('listening');
+                }
+            } catch (e) {
+                console.warn('[VRM] 初始化失败', e);
+                const hint = e.message?.includes('超时') ? '\n手机端需要能访问 esm.sh，国内可能需要代理' : '';
+                toastr.warning('VRM 加载失败，将以普通语音模式继续：' + e.message + hint, '', { timeOut: 6000 });
+            }
+        })();
+    }
 
     // 停止当前正在播放的普通 TTS
     activeAudio.pause();
@@ -2047,21 +2447,22 @@ async function vcStartCall() {
 
     vcSetState('connecting');
 
-    // 更新弹窗角色信息
+    // 更新角色信息（dialog 或 VRM HUD）
     const ctx = getContext();
-    const nameEl   = document.getElementById('vc-name');
-    const avatarEl = document.getElementById('vc-avatar');
-    const phEl     = document.getElementById('vc-avatar-placeholder');
+    const nameEl = vcEl('vc-name');
     if (nameEl) nameEl.textContent = ctx.name2 || 'AI';
-    const charAvatar = ctx.characters?.[ctx.characterId]?.avatar;
-    if (avatarEl) { avatarEl.src = charAvatar ? `/characters/${charAvatar}` : ''; avatarEl.style.display = charAvatar ? '' : 'none'; }
-    if (phEl)     phEl.style.display = charAvatar ? 'none' : '';
-
-    document.getElementById('vc-dialog').classList.add('vc-dialog-open');
+    if (callMode === 'voice') {
+        const avatarEl = document.getElementById('vc-avatar');
+        const phEl     = document.getElementById('vc-avatar-placeholder');
+        const charAvatar = ctx.characters?.[ctx.characterId]?.avatar;
+        if (avatarEl) { avatarEl.src = charAvatar ? `/characters/${charAvatar}` : ''; avatarEl.style.display = charAvatar ? '' : 'none'; }
+        if (phEl)     phEl.style.display = charAvatar ? 'none' : '';
+        document.getElementById('vc-dialog').classList.add('vc-dialog-open');
+    }
 
     // 计时器
     vcStartTime = Date.now();
-    const timerEl = document.getElementById('vc-timer');
+    const timerEl = vcEl('vc-timer');
     vcTimerInterval = setInterval(() => {
         const sec = Math.floor((Date.now() - vcStartTime) / 1000);
         if (timerEl) timerEl.textContent = `${String(Math.floor(sec / 60)).padStart(2,'0')}:${String(sec % 60).padStart(2,'0')}`;
@@ -2105,13 +2506,18 @@ function vcEndCall() {
     if (vcPlaybackCtx) { try { vcPlaybackCtx.close(); } catch (_) {} vcPlaybackCtx = null; }
     if (vcStream)      { vcStream.getTracks().forEach(t => t.stop()); vcStream = null; }
     vcAnalyser = null;
+
+    // VRM 清理
+    if (vrmModule) { try { vrmModule.destroy(); } catch (_) {} }
+    vrmAnalyserNode = null;
+    document.documentElement.classList.remove('mm-vc-active');
     if (vcTimerInterval) { clearInterval(vcTimerInterval); vcTimerInterval = null; }
 
-    document.getElementById('vc-dialog')?.classList.remove('vc-dialog-open');
-    const log = document.getElementById('vc-log');
+    if (callMode === 'voice') document.getElementById('vc-dialog')?.classList.remove('vc-dialog-open');
+    const log = vcEl('vc-log');
     if (log) log.innerHTML = '';
     vcMuted = false;
-    const muteBtn = document.getElementById('vc-mute');
+    const muteBtn = vcEl('vc-mute');
     if (muteBtn) {
         muteBtn.classList.remove('vc-btn-muted');
         muteBtn.querySelector('i').className = 'fa-solid fa-microphone';
@@ -2121,7 +2527,7 @@ function vcEndCall() {
 
 function vcToggleMute() {
     vcMuted = !vcMuted;
-    const btn = document.getElementById('vc-mute');
+    const btn = vcEl('vc-mute');
     if (btn) {
         btn.classList.toggle('vc-btn-muted', vcMuted);
         btn.querySelector('i').className = vcMuted ? 'fa-solid fa-microphone-slash' : 'fa-solid fa-microphone';
@@ -2195,18 +2601,21 @@ function vcCreateUi() {
     fab.addEventListener('pointerup',     onPointerEnd);
     fab.addEventListener('pointercancel', onPointerEnd);
 
-    // 拖动后忽略 click，未拖动才触发通话
+    // 拖动后忽略 click，未拖动才触发语音通话
     fab.addEventListener('click', () => {
         if (wasDragged) { wasDragged = false; return; }
-        vcState === 'idle' ? vcStartCall() : vcEndCall();
+        if (vcState === 'idle') { callMode = 'voice'; vcStartCall(); } else vcEndCall();
     });
 
-    // 窗口缩放时把悬浮球夹回可视区
+    // 窗口缩放时把悬浮球夹回可视区，同时更新 VRM 渲染器
     window.addEventListener('resize', () => {
         if (fab.style.left) {
             fab.style.left = clamp(parseFloat(fab.style.left), 0, window.innerWidth  - 52) + 'px';
             fab.style.top  = clamp(parseFloat(fab.style.top),  0, window.innerHeight - 52) + 'px';
         }
+        const vrmC = document.getElementById('vc-vrm-canvas');
+        if (vrmC && vrmModule?.isReady() && document.documentElement.classList.contains('mm-vc-active'))
+            vrmModule.resize(vrmC);
     }, { passive: true });
 
     const dialog = document.createElement('div');
@@ -2242,12 +2651,105 @@ function vcCreateUi() {
     document.documentElement.appendChild(dialog);
     document.getElementById('vc-hangup').addEventListener('click', vcEndCall);
     document.getElementById('vc-mute').addEventListener('click', vcToggleMute);
+
+    // ── 视频通话悬浮球（独立于语音 FAB） ──────────────────────────────────────
+    const vrmFab = document.createElement('div');
+    vrmFab.id    = 'vrm-fab';
+    vrmFab.title = '视频通话';
+    vrmFab.innerHTML = '<i class="fa-solid fa-video"></i>';
+    if (!s().vrmEnabled) vrmFab.style.display = 'none';
+    document.documentElement.appendChild(vrmFab);
+
+    {
+        let vDragging = false, vWasDragged = false, vox = 0, voy = 0;
+        const vClamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+        const vTakeOver = (x, y) => {
+            vrmFab.style.left = vClamp(x, 0, window.innerWidth  - 52) + 'px';
+            vrmFab.style.top  = vClamp(y, 0, window.innerHeight - 52) + 'px';
+        };
+        try {
+            const p = JSON.parse(localStorage.getItem('vrm-fab-pos') || 'null');
+            if (p && typeof p.l === 'number') vTakeOver(p.l, p.t);
+            else vTakeOver((window.innerWidth - 52) / 2 + 64, window.innerHeight - 52 - 80);
+        } catch (_) { vTakeOver((window.innerWidth - 52) / 2 + 64, window.innerHeight - 52 - 80); }
+
+        vrmFab.addEventListener('pointerdown', e => {
+            vDragging = true; vWasDragged = false;
+            vrmFab.setPointerCapture(e.pointerId);
+            const r = vrmFab.getBoundingClientRect();
+            vox = e.clientX - r.left; voy = e.clientY - r.top;
+            vrmFab.style.transition = 'box-shadow 0.18s ease';
+            e.preventDefault();
+        }, { passive: false });
+        vrmFab.addEventListener('pointermove', e => {
+            if (!vDragging) return;
+            vTakeOver(e.clientX - vox, e.clientY - voy);
+            vWasDragged = true; e.preventDefault();
+        }, { passive: false });
+        const vOnEnd = e => {
+            if (!vDragging) return;
+            vDragging = false;
+            vrmFab.releasePointerCapture(e.pointerId);
+            vrmFab.style.transition = '';
+            if (vWasDragged) {
+                const r = vrmFab.getBoundingClientRect();
+                try { localStorage.setItem('vrm-fab-pos', JSON.stringify({ l: r.left, t: r.top })); } catch (_) {}
+            }
+        };
+        vrmFab.addEventListener('pointerup',     vOnEnd);
+        vrmFab.addEventListener('pointercancel', vOnEnd);
+        vrmFab.addEventListener('click', () => {
+            if (vWasDragged) { vWasDragged = false; return; }
+            if (vcState === 'idle') { callMode = 'video'; vcStartCall(); } else vcEndCall();
+        });
+        window.addEventListener('resize', () => {
+            if (vrmFab.style.left) {
+                vrmFab.style.left = vClamp(parseFloat(vrmFab.style.left), 0, window.innerWidth  - 52) + 'px';
+                vrmFab.style.top  = vClamp(parseFloat(vrmFab.style.top),  0, window.innerHeight - 52) + 'px';
+            }
+        }, { passive: true });
+    }
+
+    // ── VRM 全屏帧（独立于 vc-dialog，通话时展开） ─────────────────────────────
+    const vrmFrame = document.createElement('div');
+    vrmFrame.id = 'mm-vrm-frame';
+    vrmFrame.innerHTML = `
+        <canvas id="vc-vrm-canvas" width="960" height="1440"></canvas>
+        <div id="vc-vrm-progress" class="vc-vrm-progress"></div>
+        <div id="mm-vrm-hud">
+            <div id="vrm-log" class="vc-log vrm-hud-log"></div>
+            <div class="vc-controls vrm-hud-controls">
+                <button id="vrm-mute" class="vc-btn" title="静音">
+                    <i class="fa-solid fa-microphone"></i><span>静音</span>
+                </button>
+                <button id="vrm-hangup" class="vc-btn vc-btn-end" title="挂断">
+                    <i class="fa-solid fa-phone-slash"></i><span>挂断</span>
+                </button>
+            </div>
+        </div>`;
+    document.documentElement.appendChild(vrmFrame);
+    document.getElementById('vrm-hangup').addEventListener('click', vcEndCall);
+    document.getElementById('vrm-mute').addEventListener('click', vcToggleMute);
+
+    // ── 悬浮信息条：在 VRM 与聊天框分界处居中显示角色名/计时/状态 ─────────────
+    const infoBar = document.createElement('div');
+    infoBar.id = 'mm-vrm-info';
+    infoBar.innerHTML = `
+        <span id="vrm-info-name">接通中...</span>
+        <div class="mm-vrm-meta">
+            <span id="vrm-info-timer">00:00</span>
+            <span class="mm-vrm-dot">·</span>
+            <span id="vrm-info-status">连接中</span>
+        </div>`;
+    document.documentElement.appendChild(infoBar);
 }
 
 // ── 入口（独立 jQuery 块，不改动原有代码） ────────────────────────────────────
 jQuery(async () => {
     vcLoadSettings();
     vcCreateUi();
+    // 页面加载时恢复 VRM blob URL（从 IndexedDB）
+    await restoreVrmBlobUrl();
 
     // 通话期间屏蔽普通自动播放（已由通话模块接管）
     // CHARACTER_MESSAGE_RENDERED 无需在此处理，vcStreamingLlm 直接处理 LLM 流
